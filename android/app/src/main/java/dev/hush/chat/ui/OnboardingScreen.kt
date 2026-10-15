@@ -1,6 +1,12 @@
 package dev.hush.chat.ui
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -48,6 +54,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.hush.chat.R
 import dev.hush.chat.ui.components.clickableNoRipple
+import dev.hush.chat.ui.components.clickableNoRipple
 import dev.hush.chat.ui.theme.HushAccent
 import dev.hush.chat.ui.theme.HushOnline
 import dev.hush.chat.ui.theme.HushSurfaceElevated
@@ -57,12 +64,14 @@ import dev.hush.chat.ui.theme.HushTextTertiary
 /**
  * Onboarding.
  *
- * Two fields, and the second one is not optional. There is no public HUSH
- * relay to point a new install at, so the shipped default
- * (`wss://hush.local:8443/ws`) is a placeholder that will never resolve.
- * Without this field a fresh install lands on an empty roster behind a
- * "reconnecting" banner, with the relay buried in Settings — which is the
- * worst possible first five seconds for someone evaluating the app.
+ * One field. The relay is a piece of infrastructure the person using this app
+ * should not have to know exists — they pick a name, and it connects.
+ *
+ * The relay field is still here, behind "Advanced", because self-hosting is a
+ * real thing people want and the answer must not be "edit the APK". But it is
+ * collapsed, unlabelled with jargon, and off by default. The previous version
+ * showed it as a required field with a placeholder that resolved nowhere,
+ * which meant every new install opened onto a dead connection screen.
  */
 @Composable
 fun OnboardingScreen(
@@ -72,6 +81,7 @@ fun OnboardingScreen(
 ) {
     var name by remember { mutableStateOf("") }
     var relay by remember { mutableStateOf(initialRelay) }
+    var showAdvanced by remember { mutableStateOf(false) }
     val focus = remember { FocusRequester() }
     val keyboard = LocalSoftwareKeyboardController.current
 
@@ -175,39 +185,66 @@ fun OnboardingScreen(
                 color = HushTextTertiary,
             )
 
+            // --- Advanced, collapsed -------------------------------------
+            // Self-hosting stays available; being told about it does not.
             Spacer(Modifier.height(20.dp))
 
-            Text(
-                text = "Relay address",
-                style = MaterialTheme.typography.labelMedium,
-                color = HushTextTertiary,
-            )
-            Spacer(Modifier.height(8.dp))
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickableNoRipple { showAdvanced = !showAdvanced }
+                    .padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = "Advanced",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = HushTextSecondary,
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    text = if (showAdvanced) "−" else "+",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = HushTextTertiary,
+                )
+                Spacer(Modifier.width(10.dp))
+                Text(
+                    text = "Use your own server",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = HushTextTertiary,
+                )
+            }
 
-            OutlinedTextField(
-                value = relay,
-                onValueChange = { relay = it.trim() },
-                modifier = Modifier.fillMaxWidth(),
-                placeholder = { Text("wss://192.168.1.12:8443/ws", color = HushTextTertiary, fontSize = 13.sp) },
-                singleLine = true,
-                shape = RoundedCornerShape(14.dp),
-                textStyle = MaterialTheme.typography.bodyMedium,
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Go),
-                keyboardActions = KeyboardActions(onGo = { submit() }),
-                colors = OutlinedTextFieldDefaults.colors(
-                    focusedBorderColor = HushAccent,
-                    unfocusedBorderColor = HushSurfaceElevated,
-                    focusedContainerColor = HushSurfaceElevated.copy(alpha = 0.4f),
-                    unfocusedContainerColor = HushSurfaceElevated.copy(alpha = 0.25f),
-                ),
-            )
-
-            Spacer(Modifier.height(8.dp))
-            Text(
-                text = "The server your messages pass through. It can read none of them. Point both devices at the same one.",
-                style = MaterialTheme.typography.bodySmall,
-                color = HushTextTertiary,
-            )
+            AnimatedVisibility(visible = showAdvanced, enter = fadeIn() + expandVertically(), exit = fadeOut() + shrinkVertically()) {
+                Column {
+                    Spacer(Modifier.height(10.dp))
+                    OutlinedTextField(
+                        value = relay,
+                        onValueChange = { relay = it.trim() },
+                        modifier = Modifier.fillMaxWidth(),
+                        placeholder = {
+                            Text("wss://your-relay.example/ws", color = HushTextTertiary, fontSize = 13.sp)
+                        },
+                        singleLine = true,
+                        shape = RoundedCornerShape(14.dp),
+                        textStyle = MaterialTheme.typography.bodyMedium,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Go),
+                        keyboardActions = KeyboardActions(onGo = { submit() }),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = HushAccent,
+                            unfocusedBorderColor = HushSurfaceElevated,
+                            focusedContainerColor = HushSurfaceElevated.copy(alpha = 0.4f),
+                            unfocusedContainerColor = HushSurfaceElevated.copy(alpha = 0.25f),
+                        ),
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        text = "The server your messages pass through. It can read none of them. Everyone on this relay can see each other.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = HushTextTertiary,
+                    )
+                }
+            }
 
             Spacer(Modifier.height(24.dp))
 

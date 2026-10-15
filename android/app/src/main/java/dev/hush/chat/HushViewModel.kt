@@ -453,9 +453,18 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
         private const val TYPING_TIMEOUT_MS = 4_000L
         private const val TYPING_THROTTLE_MS = 1_500L
 
-        // No public relay exists to point a new install at, so this is a
-        // placeholder that will not resolve. Onboarding shows it as an editable
-        // field for exactly that reason — do not treat it as a working default.
-        const val DEFAULT_RELAY = "wss://hush.local:8443/ws"
+        /**
+         * The public relay every install connects to by default.
+         *
+         * This is the whole point of the app being usable by someone who has
+         * never heard the word "relay". An earlier draft shipped
+         * `wss://hush.local:8443/ws` — a placeholder that has never resolved —
+         * because no public relay existed when the app was written. It did by
+         * the time the app was finished, and shipping the placeholder anyway
+         * meant every new install opened to a red "Unable to resolve host"
+         * banner and no obvious way out. The field now lives under Advanced,
+         * for people running their own.
+         */
+        const val DEFAULT_RELAY = "wss://spudpotato.itskeshavm.workers.dev/ws"
     }
 }

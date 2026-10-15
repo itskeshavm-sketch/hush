@@ -28,10 +28,10 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-        // The relay the app talks to out of the box. Self-hosted operators
-        // change this in Settings; it is a runtime preference, not a build
-        // constant, so one APK serves every deployment.
-        buildConfigField("String", "DEFAULT_RELAY", "\"wss://hush.local:8443/ws\"")
+        // The relay every install connects to unless the user self-hosts.
+        // A build-time constant so the URL is auditable in the APK rather than
+        // assembled at runtime, and overridable in Settings.
+        buildConfigField("String", "DEFAULT_RELAY", "\"wss://spudpotato.itskeshavm.workers.dev/ws\"")
     }
 
     signingConfigs {

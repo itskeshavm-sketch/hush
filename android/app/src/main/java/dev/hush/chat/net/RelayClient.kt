@@ -142,11 +142,24 @@ class RelayClient(
         _roster.value = emptyList()
     }
 
+    /**
+     * Called the first time a relay's certificate is seen, so the app can
+     * persist it. Without this the pin is re-derived on every launch and
+     * "trust on first use" silently degrades into "trust always", which is the
+     * thing pinning exists to prevent.
+     */
+    var onPinObserved: ((String) -> Unit)? = null
+
     /** Re-baseline the pin against the certificate currently being served. */
     fun updatePin(fingerprintHex: String) {
         pin = fingerprintHex
-        // Force a fresh handshake so the new pin is exercised immediately
-        // rather than at some unpredictable future reconnect.
+        // A changed pin invalidates the cached client: OkHttp bakes the trust
+        // manager into the SSL socket factory at construction, so reusing it
+        // would keep enforcing the OLD pin and fail forever.
+        client?.dispatcher?.executorService?.shutdown()
+        client?.connectionPool?.evictAll()
+        client = null
+
         val url = endpoint
         val frame = hello
         if (url != null && frame != null) {
@@ -208,22 +221,35 @@ class RelayClient(
     private fun buildClient(): OkHttpClient {
         client?.let { return it }
 
+        // Trust on first use. With no recorded pin the relay's certificate is
+        // accepted and observed; the app persists that fingerprint so every
+        // later connection must present exactly the same one.
+        //
+        // A plain `CertificatePinner` cannot do this job: pinning only runs
+        // *after* the chain validates against the system trust store, and a
+        // self-signed relay never gets that far. The failure mode of getting
+        // this wrong is an app that cannot connect to any self-hosted relay on
+        // the first try, with the fingerprint capture code unreachable.
+        val trustManager = TofuTrustManager(
+            pinnedHex = pin,
+            onObserved = { fp ->
+                _pinnedFingerprint.value = fp
+                if (pin == null) {
+                    pin = fp
+                    onPinObserved?.invoke(fp)
+                }
+            },
+        )
+
+        val sslContext = buildSslContext(trustManager)
+
         val builder = OkHttpClient.Builder()
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(0, TimeUnit.MILLISECONDS) // long-lived socket
             .writeTimeout(15, TimeUnit.SECONDS)
             .pingInterval(25, TimeUnit.SECONDS)
             .retryOnConnectionFailure(true)
-
-        // Pinning is opt-in per connection. With no pin we fall back to the
-        // system trust store, which is correct for a relay with a real cert and
-        // is exactly what captures the fingerprint on first contact.
-        val fingerprint = pin
-        if (fingerprint != null) {
-            val host = url().toHttpUrlOrNull()?.host
-                ?: throw IllegalStateException("relay URL is not parseable: $endpoint")
-            builder.certificatePinner(TlsPinner.pinnerFor(host, fingerprint))
-        }
+            .sslSocketFactory(sslContext.socketFactory, trustManager)
 
         return builder.build().also { client = it }
     }
@@ -236,17 +262,14 @@ class RelayClient(
             attempt = 0
             Log.i(TAG, "relay socket open")
 
-            // Capture the presented certificate so a self-signed relay can be
-            // pinned on first contact rather than rejected outright.
-            //
-            // `Handshake.peerCertificates` is typed List<Certificate>, not
-            // List<X509Certificate>; the runtime objects are X509 but the
-            // static type is not, so the cast has to happen here.
+            // The trust manager already observed the certificate during the
+            // handshake; this is belt-and-braces for a chain that validated
+            // through the system store instead.
             response.handshake?.peerCertificates
                 ?.filterIsInstance<java.security.cert.X509Certificate>()
                 ?.takeIf { it.isNotEmpty() }
                 ?.let { chain ->
-                    TlsPinner.fingerprintOf(chain)?.let { fp ->
+                    TlsPinner.fingerprintHex(chain)?.let { fp ->
                         _pinnedFingerprint.value = fp
                         if (pin == null) pin = fp
                     }
@@ -293,13 +316,14 @@ class RelayClient(
             val message = t.message ?: t.javaClass.simpleName
 
             // A pin failure is terminal by design. Retrying a handshake that
-            // cannot succeed just burns battery and hides the problem.
-            if (t is javax.net.ssl.SSLPeerUnverifiedException) {
+            // cannot succeed just burns battery and hides the problem behind a
+            // spinner that never resolves.
+            if (t is java.security.cert.CertificateException) {
                 _state.value = RelayState.Failed(
-                    reason = "Certificate pin mismatch. This is not the relay you pinned.",
+                    reason = message.ifEmpty { "The relay's certificate did not match the one recorded." },
                     recoverable = false,
                 )
-                Log.e(TAG, "pin mismatch", t)
+                Log.e(TAG, "certificate rejected", t)
                 return
             }
 

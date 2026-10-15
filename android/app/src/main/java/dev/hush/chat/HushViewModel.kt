@@ -103,14 +103,28 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
      * There is no sign-up beyond a display name. That is the entire flow by
      * design: HUSH has no server-side account, so there is nothing to register
      * for and no credential to leak.
+     *
+     * The relay is set here too rather than only in Settings, because the
+     * shipped default is a placeholder that cannot resolve — a new install
+     * with no way to fix that before connecting is a dead app.
      */
-    fun completeOnboarding(name: String) {
+    fun completeOnboarding(name: String, relay: String = relayUrl) {
         val trimmed = name.trim()
         if (trimmed.isEmpty()) {
             emitToast("Pick a display name")
             return
         }
-        prefs.edit().putString(KEY_DISPLAY_NAME, trimmed).apply()
+        val url = relay.trim()
+        if (!url.startsWith("wss://")) {
+            emitToast("Relay must be a wss:// address")
+            return
+        }
+
+        prefs.edit()
+            .putString(KEY_DISPLAY_NAME, trimmed)
+            .putString(KEY_RELAY_URL, url)
+            .apply()
+
         _screen.value = Screen.Roster
         startRelay()
     }
@@ -139,6 +153,13 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
     private fun startRelay() {
         val hello = sessions.buildHello(displayName, prefs.getLong(KEY_JOINED_AT, 0L))
         val pin = prefs.getString(KEY_RELAY_PIN, null)
+
+        // Persist the first observed certificate. Without this, every launch
+        // re-runs first-use trust and a pinned relay is really just a trusted
+        // one — which is the exact failure pinning exists to prevent.
+        relay.onPinObserved = { fp ->
+            prefs.edit().putString(KEY_RELAY_PIN, fp).apply()
+        }
 
         relay.connect(relayUrl, pin, hello)
         observeFrames()
@@ -432,6 +453,9 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
         private const val TYPING_TIMEOUT_MS = 4_000L
         private const val TYPING_THROTTLE_MS = 1_500L
 
+        // No public relay exists to point a new install at, so this is a
+        // placeholder that will not resolve. Onboarding shows it as an editable
+        // field for exactly that reason — do not treat it as a working default.
         const val DEFAULT_RELAY = "wss://hush.local:8443/ws"
     }
 }

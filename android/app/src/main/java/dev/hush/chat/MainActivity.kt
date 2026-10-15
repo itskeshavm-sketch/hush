@@ -65,7 +65,8 @@ private fun HushRoot(viewModel: HushViewModel = viewModel()) {
     ) { _ ->
         when (val s = screen) {
             is Screen.Onboarding -> OnboardingScreen(
-                onContinue = viewModel::completeOnboarding,
+                initialRelay = viewModel.relayUrl,
+                onContinue = { name, relay -> viewModel.completeOnboarding(name, relay) },
             )
 
             is Screen.Roster -> RosterScreen(

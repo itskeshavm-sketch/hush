@@ -43,6 +43,7 @@ import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.hush.chat.R
@@ -56,23 +57,27 @@ import dev.hush.chat.ui.theme.HushTextTertiary
 /**
  * Onboarding.
  *
- * One field. That is the whole flow, and the copy says why out loud: HUSH has
- * no server-side account, so there is nothing to sign up for. A messenger that
- * asks for a display name and nothing else is making a real architectural
- * promise, and burying that would waste it.
+ * Two fields, and the second one is not optional. There is no public HUSH
+ * relay to point a new install at, so the shipped default
+ * (`wss://hush.local:8443/ws`) is a placeholder that will never resolve.
+ * Without this field a fresh install lands on an empty roster behind a
+ * "reconnecting" banner, with the relay buried in Settings — which is the
+ * worst possible first five seconds for someone evaluating the app.
  */
 @Composable
 fun OnboardingScreen(
-    onContinue: (String) -> Unit,
+    initialRelay: String,
+    onContinue: (name: String, relayUrl: String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var name by remember { mutableStateOf("") }
+    var relay by remember { mutableStateOf(initialRelay) }
     val focus = remember { FocusRequester() }
     val keyboard = LocalSoftwareKeyboardController.current
 
     val submit = {
         keyboard?.hide()
-        onContinue(name)
+        onContinue(name, relay)
     }
 
     Box(
@@ -170,7 +175,41 @@ fun OnboardingScreen(
                 color = HushTextTertiary,
             )
 
-            Spacer(Modifier.height(28.dp))
+            Spacer(Modifier.height(20.dp))
+
+            Text(
+                text = "Relay address",
+                style = MaterialTheme.typography.labelMedium,
+                color = HushTextTertiary,
+            )
+            Spacer(Modifier.height(8.dp))
+
+            OutlinedTextField(
+                value = relay,
+                onValueChange = { relay = it.trim() },
+                modifier = Modifier.fillMaxWidth(),
+                placeholder = { Text("wss://192.168.1.12:8443/ws", color = HushTextTertiary, fontSize = 13.sp) },
+                singleLine = true,
+                shape = RoundedCornerShape(14.dp),
+                textStyle = MaterialTheme.typography.bodyMedium,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Go),
+                keyboardActions = KeyboardActions(onGo = { submit() }),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor = HushAccent,
+                    unfocusedBorderColor = HushSurfaceElevated,
+                    focusedContainerColor = HushSurfaceElevated.copy(alpha = 0.4f),
+                    unfocusedContainerColor = HushSurfaceElevated.copy(alpha = 0.25f),
+                ),
+            )
+
+            Spacer(Modifier.height(8.dp))
+            Text(
+                text = "The server your messages pass through. It can read none of them. Point both devices at the same one.",
+                style = MaterialTheme.typography.bodySmall,
+                color = HushTextTertiary,
+            )
+
+            Spacer(Modifier.height(24.dp))
 
             Button(
                 onClick = submit,

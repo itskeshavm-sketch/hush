@@ -108,7 +108,7 @@ class CallActivity : ComponentActivity() {
 private fun HushCallTheme(content: @Composable () -> Unit) {
     // The call screen is always dark: it may be showing a video feed, and a
     // light chrome around one looks broken.
-    dev.hush.chat.ui.theme.HushTheme(darkTheme = true, content = content)
+    dev.hush.chat.ui.theme.HushTheme(content = content)
 }
 
 @Composable

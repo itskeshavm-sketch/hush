@@ -1,6 +1,9 @@
 package dev.hush.chat.ui
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -9,6 +12,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -18,8 +22,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Fingerprint
-import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -46,6 +50,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.hush.chat.ui.components.SectionHeader
 import dev.hush.chat.ui.theme.HushAccent
+import dev.hush.chat.ui.theme.HushThemeCatalog
+import dev.hush.chat.ui.theme.HushThemeKeys
 import dev.hush.chat.ui.theme.HushDanger
 import dev.hush.chat.ui.theme.HushOnline
 import dev.hush.chat.ui.theme.HushSurfaceElevated
@@ -56,25 +62,27 @@ import dev.hush.chat.ui.theme.HushWarning
 /**
  * Settings.
  *
- * Two settings exist, both of which matter: who you appear as, and which relay
- * you connect to. Everything else in HUSH is either non-configurable on purpose
- * (message retention is zero, always) or shown as a read-only fact (the relay's
- * pinned fingerprint).
+ * Who you appear as, how the app looks, and the connection's pinned
+ * certificate. Everything else in HUSH is either non-configurable on purpose
+ * (message retention is zero, always) or shown as a read-only fact.
+ *
+ * There is deliberately no relay address field here. Every install uses the
+ * same public relay, and a server address a user can mistype is a support
+ * ticket that never needed to exist.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsScreen(
     displayName: String,
-    relayUrl: String,
+    themeKey: String,
     relayFingerprint: String?,
     onDisplayNameChange: (String) -> Unit,
-    onRelayUrlChange: (String) -> Unit,
+    onThemeChange: (String) -> Unit,
     onTrustNewCertificate: (String) -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var name by remember(displayName) { mutableStateOf(displayName) }
-    var relay by remember(relayUrl) { mutableStateOf(relayUrl) }
 
     Scaffold(
         modifier = modifier,
@@ -114,17 +122,15 @@ fun SettingsScreen(
                 "Anyone can pick this name. It is a label, not an identity — compare safety numbers, not names.",
             )
 
-            SectionHeader("Relay")
-            SettingsField(
-                value = relay,
-                onValueChange = { relay = it },
-                label = "wss://…/ws",
-                icon = { Icon(Icons.Filled.Language, contentDescription = null, tint = HushTextTertiary) },
-                keyboardType = KeyboardType.Uri,
-                onCommit = { if (it != relayUrl) onRelayUrlChange(it) },
+            SectionHeader("Appearance")
+            ThemePicker(
+                selectedKey = themeKey,
+                onSelect = onThemeChange,
             )
 
             Spacer(Modifier.height(14.dp))
+
+            SectionHeader("Connection")
 
             Column(
                 modifier = Modifier
@@ -212,6 +218,106 @@ fun SettingsScreen(
         }
     }
 }
+
+/**
+ * One row per theme: three palette dots, the name, one line of character, and
+ * a check when selected. Tapping repaints the whole app instantly, because
+ * every screen reads colour through the same palette.
+ */
+@Composable
+private fun ThemePicker(
+    selectedKey: String,
+    onSelect: (String) -> Unit,
+) {
+    Column(
+        modifier = Modifier.padding(horizontal = 20.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        HushThemeCatalog.forEach { palette ->
+            val selected = palette.key == selectedKey
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(
+                        if (selected) HushAccent.copy(alpha = 0.12f)
+                        else HushSurfaceElevated.copy(alpha = 0.4f),
+                    )
+                    .border(
+                        BorderStroke(
+                            if (selected) 1.5.dp else 0.dp,
+                            if (selected) HushAccent else HushSurfaceElevated,
+                        ),
+                        RoundedCornerShape(16.dp),
+                    )
+                    .clickable { onSelect(palette.key) }
+                    .padding(14.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Row {
+                    listOf(palette.background, palette.accent, palette.textPrimary).forEachIndexed { i, dot ->
+                        Box(
+                            modifier = Modifier
+                                .offset(x = (-8 * i).dp)
+                                .size(24.dp)
+                                .clip(androidx.compose.foundation.shape.CircleShape)
+                                .background(dot)
+                                .border(
+                                    BorderStroke(1.5.dp, HushSurfaceElevated),
+                                    androidx.compose.foundation.shape.CircleShape,
+                                ),
+                        )
+                    }
+                }
+                Spacer(Modifier.width(12.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = ThemeNames[palette.key] ?: palette.key,
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.onBackground,
+                    )
+                    Text(
+                        text = ThemeNotes[palette.key] ?: "",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = HushTextTertiary,
+                    )
+                }
+                if (selected) {
+                    Box(
+                        modifier = Modifier
+                            .size(26.dp)
+                            .clip(androidx.compose.foundation.shape.CircleShape)
+                            .background(HushAccent),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Check,
+                            contentDescription = "Selected",
+                            tint = MaterialTheme.colorScheme.background,
+                            modifier = Modifier.size(15.dp),
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+private val ThemeNames = mapOf(
+    HushThemeKeys.LAMP to "Lamp Room",
+    HushThemeKeys.REDACTED to "Redacted File",
+    HushThemeKeys.SPEAKEASY to "Speakeasy",
+    HushThemeKeys.CLEAN to "Clean Room",
+    HushThemeKeys.NEON to "Neon Sign",
+)
+
+private val ThemeNotes = mapOf(
+    HushThemeKeys.LAMP to "Lamp amber over night water",
+    HushThemeKeys.REDACTED to "Stamp red, redaction bars",
+    HushThemeKeys.SPEAKEASY to "Brass fittings, oxblood seal",
+    HushThemeKeys.CLEAN to "True white, Klein blue",
+    HushThemeKeys.NEON to "Tube pink on real black",
+)
 
 @Composable
 private fun SettingsField(

@@ -33,9 +33,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
 
         setContent {
-            HushTheme {
-                HushRoot()
-            }
+            HushRoot()
         }
     }
 }
@@ -51,6 +49,8 @@ private fun HushRoot(viewModel: HushViewModel = viewModel()) {
     val relayState by viewModel.relayState.collectAsStateWithLifecycle()
     val fingerprint by viewModel.pinnedFingerprint.collectAsStateWithLifecycle()
 
+    val themeKey by viewModel.themeKey.collectAsStateWithLifecycle()
+
     val snackbar = remember { SnackbarHostState() }
 
     LaunchedEffect(toast) {
@@ -60,6 +60,7 @@ private fun HushRoot(viewModel: HushViewModel = viewModel()) {
         }
     }
 
+    HushTheme(themeKey = themeKey) {
     androidx.compose.material3.Scaffold(
         snackbarHost = { SnackbarHost(snackbar) },
     ) { _ ->
@@ -113,10 +114,10 @@ private fun HushRoot(viewModel: HushViewModel = viewModel()) {
 
             is Screen.Settings -> SettingsScreen(
                 displayName = viewModel.displayName,
-                relayUrl = viewModel.relayUrl,
+                themeKey = themeKey,
                 relayFingerprint = fingerprint,
                 onDisplayNameChange = viewModel::changeDisplayName,
-                onRelayUrlChange = viewModel::setRelayUrl,
+                onThemeChange = viewModel::setTheme,
                 onTrustNewCertificate = viewModel::trustNewRelayCertificate,
                 onBack = { viewModel.navigate(Screen.Roster) },
             )
@@ -134,6 +135,7 @@ private fun HushRoot(viewModel: HushViewModel = viewModel()) {
                 viewModel.navigate(Screen.Roster)
             }
         }
+    }
     }
 }
 

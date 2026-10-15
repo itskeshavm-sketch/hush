@@ -23,8 +23,16 @@ import kotlin.concurrent.withLock
 
 /** Result of decrypting an inbound frame. */
 sealed interface InboundResult {
-    /** Ordinary chat text. */
-    data class Text(val conversationId: String, val from: String, val fromName: String, val body: String, val at: Long) : InboundResult
+    /**
+     * Ordinary chat text.
+     *
+     * [msgId] is the sender's stable message id, carried inside the encrypted
+     * payload. It must be the sender's id — not a fresh random one — or delete-
+     * for-everyone can never match the recipient's row against the sender's
+     * delete frame. That was exactly the old bug: both sides minted their own
+     * UUIDs, so a delete by the sender's id matched nothing on receipt.
+     */
+    data class Text(val conversationId: String, val from: String, val fromName: String, val body: String, val at: Long, val msgId: String) : InboundResult
 
     /** WebRTC signaling for an active call. */
     data class Signaling(val conversationId: String, val from: String, val payload: String) : InboundResult
@@ -411,12 +419,38 @@ class SessionManager(private val context: Context) {
         }
     }
 
-    private fun interpret(peerId: String, plaintext: String, kind: String): InboundResult =
+    private fun interpret(peerId: String, plaintext: String, kind: String): InboundResult {
         if (kind == "rtc") {
-            InboundResult.Signaling(peerId, peerId, plaintext)
-        } else {
-            InboundResult.Text(peerId, peerId, "", plaintext, System.currentTimeMillis())
+            return InboundResult.Signaling(peerId, peerId, plaintext)
         }
+        // Payload format v1: {"v":1,"id":"<sender uuid>","body":"..."}.
+        // Older builds sent raw text with no id; those get a fresh random id
+        // so they still display, but they can never be deleted for everyone —
+        // there is no shared id to address. Both sides on the current build
+        // always send v1, so this fallback only triggers against history.
+        val parsed = runCatching { org.json.JSONObject(plaintext) }.getOrNull()
+        if (parsed != null && parsed.optInt("v", 0) == 1) {
+            val id = parsed.optString("id")
+            val body = parsed.optString("body")
+            if (id.isNotEmpty()) {
+                return InboundResult.Text(peerId, peerId, "", body, System.currentTimeMillis(), id)
+            }
+        }
+        return InboundResult.Text(
+            peerId, peerId, "", plaintext, System.currentTimeMillis(),
+            java.util.UUID.randomUUID().toString(),
+        )
+    }
+
+    /**
+     * Build the encrypted payload for an outgoing text.
+     *
+     * The id travels inside the ciphertext so the recipient stores the same row
+     * id the sender holds. Delete-for-everyone is addressed by that id; without
+     * it the two sides disagree and deletes silently match nothing.
+     */
+    fun sealText(id: String, body: String): ByteArray =
+        org.json.JSONObject().put("v", 1).put("id", id).put("body", body).toString().toByteArray()
 
     // -------------------------------------------------------------------------
     // Safety numbers

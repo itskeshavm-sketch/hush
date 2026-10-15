@@ -83,6 +83,21 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
     val displayName: String get() = prefs.getString(KEY_DISPLAY_NAME, "") ?: ""
     val relayUrl: String get() = prefs.getString(KEY_RELAY_URL, DEFAULT_RELAY) ?: DEFAULT_RELAY
 
+    private val _themeKey =
+        MutableStateFlow(prefs.getString(KEY_APP_THEME, dev.hush.chat.ui.theme.HushThemeKeys.DEFAULT) ?: dev.hush.chat.ui.theme.HushThemeKeys.DEFAULT)
+    val themeKey: StateFlow<String> = _themeKey.asStateFlow()
+
+    /**
+     * Persist the selected appearance theme. Unknown keys are ignored rather
+     * than stored: a stale or hand-edited pref must fall back to the default
+     * instead of leaving the app in a theme that does not exist.
+     */
+    fun setTheme(key: String) {
+        if (dev.hush.chat.ui.theme.HushThemeCatalog.none { it.key == key }) return
+        prefs.edit().putString(KEY_APP_THEME, key).apply()
+        _themeKey.value = key
+    }
+
     private var joinLoop: Job? = null
     private var typingResetJob: Job? = null
     private var typingSentAt = 0L
@@ -282,7 +297,10 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
 
             val peer = _peers.value.firstOrNull { it.id == peerId }
             val bundleJson = peer?.let { prekeyFor(peerId) }
-            val sealed = sessions.encrypt(peerId, bundleJson, text.toByteArray())
+            // The id travels inside the ciphertext so the recipient stores the
+            // same row id. Without this, delete-for-everyone addresses an id
+            // the other side has never seen.
+            val sealed = sessions.encrypt(peerId, bundleJson, sessions.sealText(id, text))
             if (sealed == null) {
                 store.updateState(id, DeliveryState.FAILED)
                 // Null bundle means they never published (still connecting).
@@ -360,7 +378,11 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
             is dev.hush.chat.data.InboundResult.Text -> {
                 store.insertMessage(
                     Message(
-                        id = UUID.randomUUID().toString(),
+                        // Sender-stable id: the same value the sender holds, so
+                        // a later delete frame addressed by that id matches.
+                        // CONFLICT_REPLACE in the store makes a redelivery
+                        // idempotent rather than a duplicate.
+                        id = result.msgId,
                         conversationId = from,
                         senderId = from,
                         senderName = fromName,
@@ -419,8 +441,21 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
         val msgId = frame.optString("msgId")
         if (msgId.isEmpty()) return
         store.markDeletedForEveryone(msgId)
-        val conv = frame.optString("to").ifEmpty { frame.optString("from") }
-        if (conv.isNotEmpty()) _messages.value = store.loadMessages(conv)
+        // The relay forwards deletes as {by: sender, to: recipient, msgId}.
+        // The conversation to refresh is the SENDER's — `by` — because rows
+        // are stored under the peer's id on this side. The old code read `to`
+        // (our own id here) and reloaded the wrong conversation, so the bubble
+        // never visually changed even when the row was tombstoned.
+        val conv = frame.optString("by")
+            .ifEmpty { frame.optString("from") }
+            .ifEmpty { frame.optString("to") }
+        if (conv.isNotEmpty() && conv != sessions.localPeerId()) {
+            _messages.value = store.loadMessages(conv)
+        } else if (conv.isNotEmpty()) {
+            // Fallback: refresh whatever chat is open if the sender field is
+            // missing (old relay builds).
+            (_screen.value as? Screen.Chat)?.let { _messages.value = store.loadMessages(it.peerId) }
+        }
     }
 
     private fun handleInboundTyping(frame: JSONObject) {
@@ -525,6 +560,7 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
         private const val KEY_RELAY_URL = "relay_url"
         private const val KEY_RELAY_PIN = "relay_pin"
         private const val KEY_JOINED_AT = "joined_at"
+        private const val KEY_APP_THEME = "app_theme"
 
         private const val TYPING_TIMEOUT_MS = 4_000L
         private const val TYPING_THROTTLE_MS = 1_500L

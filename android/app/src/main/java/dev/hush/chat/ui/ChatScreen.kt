@@ -72,8 +72,17 @@ import dev.hush.chat.data.DeliveryState
 import dev.hush.chat.data.Message
 import dev.hush.chat.ui.components.InitialsAvatar
 import dev.hush.chat.ui.components.TypingIndicator
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.spring
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.Color
 import dev.hush.chat.ui.theme.HushAccent
-import dev.hush.chat.ui.theme.HushAccentMuted
+import dev.hush.chat.ui.theme.HushOnSend
+import dev.hush.chat.ui.theme.HushSend
+import dev.hush.chat.ui.theme.HushBubbleEdge
+import dev.hush.chat.ui.theme.HushBubbleIncoming
+import dev.hush.chat.ui.theme.HushBubbleOutgoing
 import dev.hush.chat.ui.theme.HushDanger
 import dev.hush.chat.ui.theme.HushSurfaceElevated
 import dev.hush.chat.ui.theme.HushTextSecondary
@@ -204,10 +213,10 @@ fun ChatScreen(
             LazyColumn(
                 state = listState,
                 modifier = Modifier.weight(1f),
-                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
-                verticalArrangement = Arrangement.spacedBy(2.dp),
+                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(3.dp),
             ) {
-                itemsIndexed(messages) { index, message ->
+                itemsIndexed(messages, key = { _, m -> m.id }) { index, message ->
                     val previous = messages.getOrNull(index - 1)
                     val showTime = previous == null ||
                         message.sentAt - previous.sentAt > TIME_SEPARATOR_GAP_MS
@@ -219,6 +228,13 @@ fun ChatScreen(
                         message = message,
                         onLongPress = { onDelete(message) },
                         onRetry = { onRetry(message) },
+                        modifier = Modifier.animateItem(
+                            fadeInSpec = null, fadeOutSpec = null,
+                            placementSpec = spring(
+                                dampingRatio = Spring.DampingRatioMediumBouncy,
+                                stiffness = Spring.StiffnessMediumLow,
+                            ),
+                        ),
                     )
                 }
             }
@@ -249,77 +265,124 @@ private fun MessageRow(
     message: Message,
     onLongPress: () -> Unit,
     onRetry: () -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     var menuOpen by remember { mutableStateOf(false) }
     val outgoing = message.isOutgoing
 
-    Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 1.dp),
-        contentAlignment = if (outgoing) Alignment.CenterEnd else Alignment.CenterStart,
+    // Entrance: new rows fade and settle rather than popping in. Placed on the
+    // row (not the bubble) so the timestamp separator rides along.
+    AnimatedVisibility(
+        visible = true,
+        enter = fadeIn() + slideInVertically(
+            initialOffsetY = { it / 3 },
+            animationSpec = spring(
+                dampingRatio = Spring.DampingRatioMediumBouncy,
+                stiffness = Spring.StiffnessMedium,
+            ),
+        ),
+        exit = fadeOut(),
+        modifier = modifier,
     ) {
-        if (message.deletedForEveryone) {
-            // A tombstone, not a blank. The user needs to know a message was
-            // removed and when, or a gap in the conversation looks like loss.
-            Text(
-                text = "This message was deleted",
-                style = MaterialTheme.typography.bodySmall,
-                color = HushTextTertiary,
-                modifier = Modifier
-                    .clip(RoundedCornerShape(12.dp))
-                    .background(HushSurfaceElevated.copy(alpha = 0.4f))
-                    .padding(horizontal = 14.dp, vertical = 7.dp),
-            )
-        } else {
-            Row(verticalAlignment = Alignment.Bottom) {
-                Box {
-                    androidx.compose.material3.Surface(
-                        modifier = Modifier
-                            .widthIn(max = 280.dp)
-                            .clip(RoundedCornerShape(
-                                topStart = 18.dp,
-                                topEnd = 18.dp,
-                                bottomStart = if (outgoing) 18.dp else 5.dp,
-                                bottomEnd = if (outgoing) 5.dp else 18.dp,
-                            ))
-                            .background(if (outgoing) HushAccentMuted else HushSurfaceElevated)
-                            .combinedClickable(onClick = {}, onLongClick = { menuOpen = true }),
-                        color = androidx.compose.ui.graphics.Color.Transparent,
-                    ) {
-                        Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 9.dp)) {
-                            Text(
-                                text = message.body,
-                                style = MaterialTheme.typography.bodyLarge,
-                                color = MaterialTheme.colorScheme.onBackground,
-                            )
-                            Spacer(Modifier.height(2.dp))
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(
-                                    text = clockFormat(message.sentAt),
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = HushTextTertiary,
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 1.dp),
+            contentAlignment = if (outgoing) Alignment.CenterEnd else Alignment.CenterStart,
+        ) {
+            if (message.deletedForEveryone) {
+                // A tombstone, not a blank. The user needs to know a message was
+                // removed and when, or a gap in the conversation looks like loss.
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(HushSurfaceElevated.copy(alpha = 0.45f))
+                        .padding(horizontal = 14.dp, vertical = 8.dp),
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Delete,
+                        contentDescription = null,
+                        tint = HushTextTertiary,
+                        modifier = Modifier.size(13.dp),
+                    )
+                    Spacer(Modifier.width(7.dp))
+                    Text(
+                        text = "This message was deleted",
+                        style = MaterialTheme.typography.bodySmall,
+                        fontWeight = FontWeight.Normal,
+                        color = HushTextTertiary,
+                    )
+                }
+            } else {
+                Row(verticalAlignment = Alignment.Bottom) {
+                    Box {
+                        val bubbleShape = RoundedCornerShape(
+                            topStart = 20.dp,
+                            topEnd = 20.dp,
+                            bottomStart = if (outgoing) 20.dp else 6.dp,
+                            bottomEnd = if (outgoing) 6.dp else 20.dp,
+                        )
+                        androidx.compose.material3.Surface(
+                            modifier = Modifier
+                                .widthIn(max = 290.dp)
+                                .shadow(
+                                    elevation = 6.dp,
+                                    shape = bubbleShape,
+                                    ambientColor = Color.Black.copy(alpha = 0.35f),
+                                    spotColor = Color.Black.copy(alpha = 0.35f),
                                 )
-                                if (outgoing) {
-                                    Spacer(Modifier.width(5.dp))
-                                    DeliveryMark(message.state, onRetry)
+                                .clip(bubbleShape)
+                                .background(if (outgoing) HushBubbleOutgoing else HushBubbleIncoming)
+                                .combinedClickable(onClick = {}, onLongClick = { menuOpen = true }),
+                            color = Color.Transparent,
+                            border = if (outgoing) null else BorderStroke(1.dp, HushBubbleEdge.copy(alpha = 0.6f)),
+                        ) {
+                            Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+                                Text(
+                                    text = message.body,
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    lineHeight = 22.sp,
+                                    color = MaterialTheme.colorScheme.onBackground,
+                                )
+                                Spacer(Modifier.height(3.dp))
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(
+                                        text = clockFormat(message.sentAt),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (outgoing) HushTextSecondary else HushTextTertiary,
+                                    )
+                                    if (outgoing) {
+                                        Spacer(Modifier.width(6.dp))
+                                        DeliveryMark(message.state, onRetry)
+                                    }
                                 }
                             }
                         }
-                    }
 
-                    DropdownMenu(
-                        expanded = menuOpen,
-                        onDismissRequest = { menuOpen = false },
-                    ) {
-                        DropdownMenuItem(
-                            text = { Text("Delete for everyone") },
-                            leadingIcon = { Icon(Icons.Filled.Delete, contentDescription = null) },
-                            onClick = {
-                                menuOpen = false
-                                onLongPress()
-                            },
-                        )
+                        DropdownMenu(
+                            expanded = menuOpen,
+                            onDismissRequest = { menuOpen = false },
+                            shape = RoundedCornerShape(16.dp),
+                            containerColor = HushSurfaceElevated,
+                            tonalElevation = 8.dp,
+                            shadowElevation = 16.dp,
+                        ) {
+                            DropdownMenuItem(
+                                text = { Text("Delete for everyone") },
+                                leadingIcon = {
+                                    Icon(
+                                        Icons.Filled.Delete,
+                                        contentDescription = null,
+                                        tint = HushDanger,
+                                    )
+                                },
+                                onClick = {
+                                    menuOpen = false
+                                    onLongPress()
+                                },
+                            )
+                        }
                     }
                 }
             }
@@ -330,30 +393,48 @@ private fun MessageRow(
 @Composable
 private fun DeliveryMark(state: DeliveryState, onRetry: () -> Unit) {
     when (state) {
+        // Double-check reads as delivered; a single check reads as sent. Text
+        // labels ("· sent") read as debug output, which is what the old UI
+        // showed and what the screenshot caught.
         DeliveryState.SENT -> Text(
-            text = "· sent",
+            text = "✓✓",
             style = MaterialTheme.typography.labelSmall,
-            color = HushTextTertiary,
+            fontWeight = FontWeight.SemiBold,
+            color = HushAccent,
+            letterSpacing = 0.sp,
         )
-        DeliveryState.PENDING -> Text(
-            text = "· queued",
-            style = MaterialTheme.typography.labelSmall,
-            color = HushTextTertiary,
-        )
+        DeliveryState.PENDING -> Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = "✓",
+                style = MaterialTheme.typography.labelSmall,
+                color = HushTextTertiary,
+            )
+            Spacer(Modifier.width(3.dp))
+            Text(
+                text = "sending",
+                style = MaterialTheme.typography.labelSmall,
+                color = HushTextTertiary,
+            )
+        }
         DeliveryState.FAILED -> Row(
             verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.clickable(onClick = onRetry),
+            modifier = Modifier
+                .clip(RoundedCornerShape(8.dp))
+                .clickable(onClick = onRetry)
+                .background(HushDanger.copy(alpha = 0.12f))
+                .padding(horizontal = 7.dp, vertical = 2.dp),
         ) {
             Icon(
-                imageVector = Icons.Filled.Error,
+                imageVector = Icons.Filled.Refresh,
                 contentDescription = "Failed to send, tap to retry",
                 tint = HushDanger,
                 modifier = Modifier.size(12.dp),
             )
-            Spacer(Modifier.width(3.dp))
+            Spacer(Modifier.width(4.dp))
             Text(
-                text = "tap to retry",
+                text = "retry",
                 style = MaterialTheme.typography.labelSmall,
+                fontWeight = FontWeight.SemiBold,
                 color = HushDanger,
             )
         }
@@ -365,13 +446,18 @@ private fun TimeSeparator(epochMs: Long) {
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(vertical = 12.dp),
+            .padding(vertical = 14.dp),
         contentAlignment = Alignment.Center,
     ) {
         Text(
             text = clockFormat(epochMs),
             style = MaterialTheme.typography.labelSmall,
-            color = HushTextTertiary,
+            fontWeight = FontWeight.Medium,
+            color = HushTextSecondary,
+            modifier = Modifier
+                .clip(RoundedCornerShape(10.dp))
+                .background(HushSurfaceElevated.copy(alpha = 0.7f))
+                .padding(horizontal = 12.dp, vertical = 4.dp),
         )
     }
 }
@@ -387,43 +473,53 @@ private fun Composer(
             .fillMaxWidth()
             .background(MaterialTheme.colorScheme.surface)
             .navigationBarsPadding()
-            .padding(horizontal = 12.dp, vertical = 8.dp),
+            .padding(horizontal = 12.dp, vertical = 10.dp),
         verticalAlignment = Alignment.Bottom,
     ) {
         TextField(
             value = draft,
             onValueChange = onDraftChange,
             modifier = Modifier.weight(1f),
-            placeholder = { Text("Message", color = HushTextTertiary) },
+            placeholder = { Text("Message…", color = HushTextTertiary) },
             maxLines = 5,
-            shape = RoundedCornerShape(22.dp),
+            shape = RoundedCornerShape(24.dp),
             textStyle = MaterialTheme.typography.bodyLarge,
             keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
             keyboardActions = KeyboardActions(onSend = { onSend() }),
             colors = TextFieldDefaults.colors(
                 focusedContainerColor = HushSurfaceElevated,
                 unfocusedContainerColor = HushSurfaceElevated,
-                focusedIndicatorColor = androidx.compose.ui.graphics.Color.Transparent,
-                unfocusedIndicatorColor = androidx.compose.ui.graphics.Color.Transparent,
+                focusedIndicatorColor = Color.Transparent,
+                unfocusedIndicatorColor = Color.Transparent,
+                cursorColor = HushAccent,
             ),
         )
 
-        Spacer(Modifier.width(8.dp))
+        Spacer(Modifier.width(10.dp))
 
         val canSend = draft.isNotBlank()
         Box(
             modifier = Modifier
-                .size(46.dp)
+                .size(48.dp)
+                .shadow(
+                    elevation = if (canSend) 10.dp else 0.dp,
+                    shape = CircleShape,
+                    ambientColor = HushSend.copy(alpha = 0.45f),
+                    spotColor = HushSend.copy(alpha = 0.45f),
+                )
                 .clip(CircleShape)
-                .background(if (canSend) HushAccent else HushSurfaceElevated)
+                .background(
+                    if (canSend) HushSend
+                    else HushSurfaceElevated.copy(alpha = 0.7f),
+                )
                 .clickable(enabled = canSend, onClick = onSend),
             contentAlignment = Alignment.Center,
         ) {
             Icon(
                 imageVector = Icons.AutoMirrored.Filled.Send,
                 contentDescription = "Send",
-                tint = if (canSend) androidx.compose.ui.graphics.Color.White else HushTextTertiary,
-                modifier = Modifier.size(19.dp),
+                tint = if (canSend) HushOnSend else HushTextTertiary,
+                modifier = Modifier.size(20.dp),
             )
         }
     }

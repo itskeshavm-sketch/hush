@@ -439,6 +439,114 @@ test('the rate limiter throttles a flood without killing the socket', async (t) 
 });
 
 // ---------------------------------------------------------------------------
+// Prekey bundles
+// ---------------------------------------------------------------------------
+
+/**
+ * A shape-valid prekey bundle. The relay does not verify the signature — that
+ * is the client's job, and it is the only thing that actually matters for
+ * security — it only checks the shape so a malformed bundle never reaches the
+ * roster.
+ */
+function validBundle() {
+  return {
+    identity: Buffer.alloc(32, 1).toString('base64'),
+    signingKey: Buffer.alloc(32, 2).toString('base64'),
+    prekey: Buffer.alloc(32, 3).toString('base64'),
+    signedPrekey: {
+      key: Buffer.alloc(32, 4).toString('base64'),
+      sig: Buffer.alloc(64, 5).toString('base64'),
+      counter: 1,
+    },
+  };
+}
+
+test('a hello carrying a valid prekey bundle is accepted', async (t) => {
+  const relay = await startRelay();
+  t.after(() => relay.close());
+
+  const p = new TestPeer(relay.url, 'Keys', pub(30));
+  await p.ready;
+  p.send({ t: 'hello', name: 'Keys', identityPub: pub(30), prekey: validBundle() });
+
+  const welcome = await p.nextOfType('welcome');
+  assert.equal(welcome.you.prekey.identity, Buffer.alloc(32, 1).toString('base64'));
+  assert.equal(welcome.you.prekey.signingKey, Buffer.alloc(32, 2).toString('base64'));
+});
+
+test('a prekey sent as a JSON string is accepted rather than rejected on type', async (t) => {
+  const relay = await startRelay();
+  t.after(() => relay.close());
+
+  // This is the shape the Android client originally sent. The validator
+  // required an object, so every real install was rejected with "prekey must
+  // be a valid X25519 prekey bundle" and the app could never connect to
+  // anyone. It went unnoticed because the Node e2e client sent no prekey at
+  // all, so the field was undefined and the branch was never entered.
+  const p = new TestPeer(relay.url, 'Stringy', pub(31));
+  await p.ready;
+  p.send({
+    t: 'hello',
+    name: 'Stringy',
+    identityPub: pub(31),
+    prekey: JSON.stringify(validBundle()),
+  });
+
+  const welcome = await p.nextOfType('welcome');
+  assert.ok(welcome.you.prekey, 'bundle survived the string round-trip');
+  assert.equal(welcome.you.prekey.prekey, Buffer.alloc(32, 3).toString('base64'));
+});
+
+test('a hello with no prekey at all is still accepted', async (t) => {
+  const relay = await startRelay();
+  t.after(() => relay.close());
+
+  const p = new TestPeer(relay.url, 'Bare', pub(32));
+  await p.ready;
+  p.send({ t: 'hello', name: 'Bare', identityPub: pub(32) });
+
+  const welcome = await p.nextOfType('welcome');
+  assert.equal(welcome.you.prekey, null);
+});
+
+test('a structurally broken prekey is rejected with a message naming the field', async (t) => {
+  const relay = await startRelay();
+  t.after(() => relay.close());
+
+  const missingSigning = validBundle();
+  delete missingSigning.signingKey; // not `.signing` — that typo made this case
+                                   // a valid bundle, so it was accepted and the
+                                   // test hung waiting for an error that could
+                                   // never arrive.
+
+  const shortIdentity = validBundle();
+  shortIdentity.identity = btoa('too short');
+
+  const badSigned = validBundle();
+  badSigned.signedPrekey = 'not an object';
+
+  const badCounter = validBundle();
+  badCounter.signedPrekey.counter = 'one';
+
+  const cases = [
+    ['missing signingKey', missingSigning],
+    ['short identity', shortIdentity],
+    ['signedPrekey not an object', badSigned],
+    ['counter not an integer', badCounter],
+  ];
+
+  for (const [label, bundle] of cases) {
+    const p = new TestPeer(relay.url, 'Broken', pub(33));
+    await p.ready;
+    p.send({ t: 'hello', name: 'Broken', identityPub: pub(33), prekey: bundle });
+    const err = await p.nextOfType('error');
+    assert.equal(err.code, 'bad_frame', `${label} should be rejected`);
+    assert.match(err.message, /prekey/i, `${label}: error should name the field`);
+    p.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Identity spoofing
 // ---------------------------------------------------------------------------
 

@@ -149,15 +149,15 @@ function validateHello(msg) {
   }
 
   const identityPub = msg.identityPub;
-  if (!isBase64(identityPub, 64)) {
-    return fail(ERROR_CODES.BAD_FRAME, 'identityPub must be base64 X25519 public key');
+  if (!isKey32(identityPub)) {
+    return fail(ERROR_CODES.BAD_FRAME, 'identityPub must be a base64 32-byte X25519 public key');
   }
 
   // Bundle public prekeys for first-contact encryption. Optional: a client that
   // has never received a prekey bundle yet still gets a usable identity for
   // the roster, it just cannot be messaged until it publishes its own.
-  const prekey = msg.prekey === undefined ? null : msg.prekey;
-  if (prekey !== null && !isPrekeyBundle(prekey)) {
+  const prekey = coerceBundle(msg.prekey);
+  if (prekey === undefined) {
     return fail(ERROR_CODES.BAD_FRAME, 'prekey must be a valid X25519 prekey bundle');
   }
 
@@ -165,6 +165,48 @@ function validateHello(msg) {
     ok: true,
     frame: { t: 'hello', name, identityPub, prekey, joined: Boolean(msg.joinedAt) },
   };
+}
+
+/**
+ * Normalise a prekey bundle from either wire shape.
+ *
+ * The Android client originally sent the bundle as a JSON *string* inside the
+ * `hello` frame, because that is how it happened to serialise the bundle. The
+ * shape check requires an object, so every real install was rejected with
+ * "prekey must be a valid X25519 prekey bundle" and the app could never
+ * connect to anyone.
+ *
+ * It went unnoticed because the Node e2e client sent no prekey at all, so the
+ * field was undefined and the branch was skipped entirely.
+ *
+ * Both shapes are accepted now. A nested object is the documented form; a
+ * string is tolerated so an older build degrades instead of breaking.
+ *
+ * This normalises the *shape* and then validates. An earlier version stopped
+ * after normalising, so any object at all was accepted — caught by the
+ * "structurally broken prekey" test on its first run, which is the only
+ * reason that test earns its keep.
+ *
+ * @returns {object|null|undefined} object, null when absent, undefined when invalid
+ */
+function coerceBundle(raw) {
+  if (raw === undefined || raw === null) return null;
+
+  let bundle;
+  if (typeof raw === 'string') {
+    try {
+      bundle = JSON.parse(raw);
+    } catch {
+      return undefined;
+    }
+  } else if (typeof raw === 'object') {
+    bundle = raw;
+  } else {
+    return undefined;
+  }
+
+  if (bundle === null || typeof bundle !== 'object') return undefined;
+  return isPrekeyBundle(bundle) ? bundle : undefined;
 }
 
 function validateSend(msg, ctx) {
@@ -311,16 +353,51 @@ function isPrekeyBundle(b) {
   return (
     b !== null &&
     typeof b === 'object' &&
-    isBase64(b.identity, 64) &&
-    isBase64(b.prekey, 64) &&
+    isKey32(b.identity) &&
+    isKey32(b.signingKey) &&
+    isKey32(b.prekey) &&
     typeof b.signedPrekey === 'object' &&
     b.signedPrekey !== null &&
-    isBase64(b.signedPrekey.key, 64) &&
+    isKey32(b.signedPrekey.key) &&
     typeof b.signedPrekey.sig === 'string' &&
     b.signedPrekey.sig.length <= 128 &&
     Number.isInteger(b.signedPrekey.counter) &&
     b.signedPrekey.counter >= 0
   );
+}
+
+/**
+ * Exactly 32 bytes, base64-encoded.
+ *
+ * `isBase64(v, 64)` only bounds the length from ABOVE, so an 8-byte string
+ * passes it — and an 8-byte "X25519 public key" would then be published in the
+ * roster, where it fails much later inside the client's key agreement with an
+ * error that points nowhere near the cause. The relay is the cheapest place to
+ * reject it, and the error it produces names the field.
+ */
+function isKey32(v) {
+  return isBase64(v, 32) && decodedLength(v) === 32;
+}
+
+/** Decoded byte length of a base64 string, or -1 if it is not decodable. */
+function decodedLength(v) {
+  try {
+    return atob(v).length;
+  } catch {
+    return -1;
+  }
+}
+
+/**
+ * Shape check, exported so a test can assert on it.
+ *
+ * The relay deliberately does NOT verify the bundle's Ed25519 signature — it
+ * has no reason to trust or distrust the claim, and verification belongs to the
+ * client that actually wants to open a session. It only checks the shape, so a
+ * malformed bundle never reaches the roster.
+ */
+export function isValidPrekeyBundle(b) {
+  return isPrekeyBundle(b);
 }
 
 export function fail(code, message) {

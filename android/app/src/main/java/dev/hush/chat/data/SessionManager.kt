@@ -134,7 +134,15 @@ class SessionManager(private val context: Context) {
             .put("t", "hello")
             .put("name", displayName)
             .put("identityPub", id.identityPublic.b64())
-            .put("prekey", bundle.toBase64Json())
+            // A nested JSONObject, not the bundle serialised to a string.
+            //
+            // The relay's validator checks `typeof prekey === 'object'`, and
+            // a JSON string fails that. Sending `.toBase64Json()` here — which
+            // is what this did originally — produced
+            // "prekey must be a valid X25519 prekey bundle" for every single
+            // install, and no test caught it because the Node e2e client
+            // never sent a prekey at all.
+            .put("prekey", org.json.JSONObject(bundle.toBase64Json()))
             .put("joined", joinedAt > 0)
     }
 

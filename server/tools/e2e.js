@@ -1,4 +1,4 @@
-/**
+﻿/**
  * End-to-end check against a *running* relay.
  *
  *   node tools/e2e.js wss://localhost:8443/ws
@@ -23,6 +23,21 @@ const fail = (m) => {
 
 const b64 = (b) => Buffer.from(b).toString('base64');
 const key = (tag) => b64(randomBytes(32).fill(0x41, 0, 1).map((_, i) => (tag + i) & 0xff));
+
+/**
+ * A shape-valid prekey bundle.
+ *
+ * This client originally sent no prekey at all, which is exactly why the
+ * string-vs-object mismatch between the Android client and the relay survived
+ * a full test cycle â€” the field was undefined, so the validation branch was
+ * never entered. Every real client must publish one.
+ */
+const prekeyBundle = (tag) => ({
+  identity: key(tag),
+  signingKey: key(tag + 1),
+  prekey: key(tag + 2),
+  signedPrekey: { key: key(tag + 3), sig: b64(randomBytes(64)), counter: 1 },
+});
 
 class Client {
   constructor(name, url) {
@@ -66,12 +81,18 @@ class Client {
     return this.next((f) => f.t === t);
   }
 
-  async join(displayName, idKey) {
+  async join(displayName, idKey, tag) {
     await this.opened;
-    this.send({ t: 'hello', name: displayName, identityPub: idKey });
+    this.send({
+      t: 'hello',
+      name: displayName,
+      identityPub: idKey,
+      prekey: prekeyBundle(tag),
+    });
     const w = await this.ofType('welcome');
     this.id = w.you.id;
     this.displayName = displayName;
+    if (!w.you.prekey) fail('relay dropped our prekey bundle');
     return this;
   }
 
@@ -82,10 +103,10 @@ class Client {
 
 console.log(`\nHUSH end-to-end against ${url}\n`);
 
-const alex = await new Client('alex', url).join('Alex', key(1));
+const alex = await new Client('alex', url).join('Alex', key(1), 10);
 pass(`Alex joined as ${alex.id}`);
 
-const alex2 = await new Client('alex2', url).join('Alex', key(2));
+const alex2 = await new Client('alex2', url).join('Alex', key(2), 20);
 pass(`Alex2 joined as ${alex2.id}`);
 
 // Wait for the roster to actually CONTAIN both peers, rather than asserting on

@@ -1,0 +1,16 @@
+{
+  "name": "hush-worker",
+  "version": "1.0.0",
+  "description": "HUSH relay on Cloudflare Workers + Durable Objects. Free tier, no card.",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^3.90.0"
+  }
+}

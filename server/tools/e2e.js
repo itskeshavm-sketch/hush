@@ -88,10 +88,15 @@ pass(`Alex joined as ${alex.id}`);
 const alex2 = await new Client('alex2', url).join('Alex', key(2));
 pass(`Alex2 joined as ${alex2.id}`);
 
-const roster = await alex.ofType('roster');
+// Wait for the roster to actually CONTAIN both peers, rather than asserting on
+// the next frame to arrive. Over a tunnel the presence broadcast is debounced
+// 120ms and the round trip is longer than that, so the first roster frame
+// Alex sees legitimately contains one peer. Asserting on arrival instead of on
+// state is a flaky test, not a relay bug.
+const roster = await alex.next((f) => f.t === 'roster' && f.peers.length >= 2, 15000);
 const names = roster.peers.map((p) => p.name);
 if (!names.includes('Alex') || roster.peers.length < 2) {
-  fail(`roster should show both Alexes, got ${JSON.stringify(roster.peers.map((p) => p.name))}`);
+  fail(`roster should show both Alexes, got ${JSON.stringify(names)}`);
 } else {
   pass(`Alex sees ${roster.peers.length} peers online: ${names.join(', ')}`);
 }
@@ -127,13 +132,12 @@ alex.send({ t: 'send', to: 'p_nobody000000000000000', envelope });
 const err = await alex.ofType('error');
 err.code === 'unknown_peer' ? pass('offline peer rejected, nothing queued') : fail(`expected unknown_peer, got ${err.code}`);
 
-// Drain anything queued from earlier in the run, so the roster we assert on is
-// unambiguously the one triggered by Alex's disconnect and not a stale frame
-// that happened to match first.
+// Drain queued presence frames so the next one we assert on is the one
+// triggered by Alex's disconnect and not a stale frame that happened to match.
 alex2.queue.length = 0;
 alex.close();
 const after = await alex2
-  .next((f) => f.t === 'roster' && f.peers.filter((p) => p.id !== alex2.id).length === 0, 5000)
+  .next((f) => f.t === 'roster' && f.peers.filter((p) => p.id !== alex2.id).length === 0, 15000)
   .catch(() => null);
 after
   ? pass('Alex2 sees the roster shrink to just itself')

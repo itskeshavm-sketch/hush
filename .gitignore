@@ -1,4 +1,4 @@
-# Build outputs
+﻿# Build outputs
 dist/
 build/
 *.apk
@@ -11,7 +11,7 @@ build/
 gradle-app.setting
 local.properties
 
-# Signing material — never commit a keystore or its passwords
+# Signing material â€” never commit a keystore or its passwords
 keystore.properties
 *.jks
 *.keystore
@@ -24,6 +24,10 @@ server/certs/
 *.key
 *.crt
 *.p12
+
+wrangler deploy state + local Durable Object storage
+.wrangler/
+worker/node_modules/
 
 # Node
 node_modules/
@@ -39,3 +43,4 @@ npm-debug.log*
 # OS
 .DS_Store
 Thumbs.db
+

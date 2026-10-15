@@ -1,0 +1,43 @@
+#:schema node_modules/wrangler/config-schema.json
+#
+# HUSH relay on Cloudflare Workers + Durable Objects.
+#
+# Free tier, no card required. `workers.dev` gets a real Let's Encrypt
+# certificate, so the Android client does not need trust-on-first-use here.
+#
+# Deploy:
+#   cd worker
+#   npm install
+#   npx wrangler deploy
+#
+# You will need a Cloudflare account. Creating one is free and does not ask
+# for a card. `wrangler login` opens a browser.
+
+name = "hush-relay"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+# workers.dev gives the relay a public hostname without touching DNS.
+workers_dev = true
+
+# The single Durable Object holding the roster.
+#
+# One global object, not a sharded set: the roster must be globally consistent
+# for two peers to see each other, and sharding would mean writing a
+# distributed presence protocol to serve a two-person test. A DO is
+# single-threaded with its own storage, which is exactly "one room, no
+# database".
+[[durable_objects.bindings]]
+name = "HUB"
+class_name = "HushRelay"
+
+# SQLite-backed storage, which is what the free tier allows Durable Objects to
+# use. Nothing is ever written — the binding exists for alarms and hibernation,
+# not for message history.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["HushRelay"]
+
+[observability]
+enabled = false

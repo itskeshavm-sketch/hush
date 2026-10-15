@@ -29,6 +29,11 @@ wrangler deploy state + local Durable Object storage
 .wrangler/
 worker/node_modules/
 
+# Cloudflare credentials. .env is picked up automatically by wrangler, so
+# this is where the deploy token belongs. NEVER commit it.
+.env
+!.env.example
+
 # Node
 node_modules/
 npm-debug.log*
@@ -43,4 +48,5 @@ npm-debug.log*
 # OS
 .DS_Store
 Thumbs.db
+
 

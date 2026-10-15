@@ -13,7 +13,13 @@
 # You will need a Cloudflare account. Creating one is free and does not ask
 # for a card. `wrangler login` opens a browser.
 
-name = "hush-relay"
+# Worker name.
+#
+# Matches the worker already created in the dashboard, so `wrangler deploy`
+# overwrites it rather than creating a second one. Keeping a single worker
+# keeps the hostname stable — the relay URL is baked into every phone that has
+# connected to it, and a second worker would mean two URLs to remember.
+name = "spudpotato"
 main = "src/index.js"
 compatibility_date = "2024-11-01"
 compatibility_flags = ["nodejs_compat"]

@@ -27,7 +27,11 @@ Published hush-relay
   https://hush-relay.<your-subdomain>.workers.dev
 ```
 
-Put that in the app's relay field as `wss://hush-relay.<your-subdomain>.workers.dev/ws`.
+Your relay URL will be:
+
+```
+wss://<worker-name>.<your-subdomain>.workers.dev/ws
+```
 
 Verify it:
 

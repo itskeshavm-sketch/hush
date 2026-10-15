@@ -420,10 +420,23 @@ class SessionManager(private val context: Context) {
      */
     fun safetyNumber(peerIdentityPublic: ByteArray, peerId: String): String {
         val id = identity ?: return ""
+        // Keys sorted so both sides hash the same order. The previous version
+        // hashed local-first, so A saw H(A,B) while B saw H(B,A) — two
+        // different "safety" numbers for the same pair, making out-of-band
+        // verification fail even with no attacker present.
+        val first: ByteArray
+        val second: ByteArray
+        if (lexCompare(id.identityKey.publicKey, peerIdentityPublic) <= 0) {
+            first = id.identityKey.publicKey
+            second = peerIdentityPublic
+        } else {
+            first = peerIdentityPublic
+            second = id.identityKey.publicKey
+        }
         val material = Primitives.concat(
             "HUSH/safety/v1".toByteArray(),
-            id.identityKey.publicKey,
-            peerIdentityPublic,
+            first,
+            second,
         )
         val digest = Primitives.blake2b(material, 30)
         val digits = StringBuilder()
@@ -434,13 +447,34 @@ class SessionManager(private val context: Context) {
     // -------------------------------------------------------------------------
 
     /**
-     * Per-conversation associated data.
+     * Associated data for every message.
      *
-     * Binding the conversation id into the AEAD tag means a ciphertext cannot
-     * be moved between conversations even if an attacker controls the relay and
-     * can reorder frames freely.
+     * This used to be `"hush|$peerId"` — the recipient's id on send, the
+     * sender's id on receive. Those are different strings, so the AEAD tag
+     * could never verify and EVERY first message failed with "Could not
+     * decrypt", deterministically, on every device, while all unit tests
+     * stayed green (they used the same aad on both sides).
+     *
+     * It is now a constant, which is the simpler correct choice the field
+     * report asked for. Cross-conversation replay is already impossible
+     * because each pair derives a distinct root key — a frame sealed for B
+     * cannot open under C's session no matter what the aad says. Binding the
+     * peer id as well would be defence in depth, but a directional binding
+     * that breaks all traffic is worse than no binding. If per-conversation
+     * binding ever returns, it must be derived from BOTH ids in a
+     * direction-independent way (sorted pair), never from one side alone.
      */
-    private fun aadFor(peerId: String): ByteArray = "hush|$peerId".toByteArray()
+    private fun aadFor(peerId: String): ByteArray = AAD_V1
+
+    /** Lexicographic unsigned-byte comparison. */
+    private fun lexCompare(a: ByteArray, b: ByteArray): Int {
+        val n = minOf(a.size, b.size)
+        for (i in 0 until n) {
+            val d = (a[i].toInt() and 0xFF) - (b[i].toInt() and 0xFF)
+            if (d != 0) return d
+        }
+        return a.size - b.size
+    }
 
     /** Forget a live session, e.g. when a safety number mismatch is detected. */
     fun resetSession(peerId: String) {
@@ -457,5 +491,8 @@ class SessionManager(private val context: Context) {
         private const val KEY_LOCAL_PREKEY = "local_prekey_private"
         private const val KEY_LOCAL_SIGNED = "local_signed_prekey_private"
         private const val KEY_LOCAL_COUNTER = "local_prekey_counter"
+
+        @JvmStatic
+        val AAD_V1: ByteArray = "HUSH/msg/v1".toByteArray()
     }
 }

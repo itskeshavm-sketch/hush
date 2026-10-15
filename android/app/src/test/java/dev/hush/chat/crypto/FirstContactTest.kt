@@ -13,16 +13,23 @@ import dev.hush.chat.crypto.b64
  *
  * This is the test for "Could not decrypt a message from X".
  *
- * The failure it pins down was a key-agreement mismatch, not a cipher bug. The
- * initiator seals against the responder's *published* signed prekey. The
- * responder answered with a key it had generated on the spot and never
- * published — while the real private half had already been wiped. Both sides
- * therefore derived different root keys, and the AEAD tag failed on the very
- * first message, for every peer, deterministically.
+ * Two separate one-line bugs have produced that exact toast, both invisible to
+ * the original suite because every test used the same aad on both sides:
  *
- * Nothing about that failure looks like a key mismatch from the outside: no
+ *  1. Key-agreement mismatch: the initiator sealed against the responder's
+ *     *published* signed prekey while the responder answered with a key it had
+ *     generated on the spot and never published. Different root keys, tag never
+ *     verifies.
+ *
+ *  2. Directional associated data: `aadFor` returned `"hush|$peerId"` — the
+ *     recipient's id when sending, the sender's id when receiving. The AEAD
+ *     tag binds the aad, so even with identical root keys every message failed
+ *     authentication on every device, deterministically, while all tests stayed
+ *     green because they passed the same string on both sides.
+ *
+ * Nothing about either failure looks like its cause from the outside: no
  * exception, no dropped frame, just an authentication tag that does not verify.
- * So it is asserted here directly.
+ * So both are asserted here directly.
  */
 class FirstContactTest {
 
@@ -186,5 +193,74 @@ class FirstContactTest {
             "swapping the prekey must invalidate the signature",
             PrekeyBundle.fromBase64Json(tampered) == null,
         )
+    }
+
+    @Test
+    fun `directional associated data breaks first contact even with correct keys`() {
+        val alice = Peer("alice")
+        val bob = Peer("bob")
+
+        val bobBundle = PrekeyBundle.fromBase64Json(bob.publishedJson())!!
+        val secret = "direction matters"
+
+        // The old SessionManager.aadFor: sender binds the recipient's id,
+        // receiver binds the sender's id. Same root keys, different aad.
+        val initiator = X3dh.initiate(alice.identity, bobBundle)
+        val aliceSession = DoubleRatchet.create(initiator, "hush|p_bob".toByteArray())
+        val frame = aliceSession.encrypt(secret.toByteArray())
+        val headerDh = frame.copyOfRange(0, DoubleRatchet.DH_KEY_LEN)
+
+        val responder = X3dh.respond(
+            identityKey = bob.identity,
+            signedPrekey = SignedPrekey(
+                bob.signed.privateKey, bob.signed.publicKey, bob.counter, bob.signature,
+            ),
+            remoteIdentityPublic = alice.identity.publicKey,
+            remoteEphemeralPublic = headerDh,
+        )
+        val bobSession = DoubleRatchet.create(responder, "hush|p_alice".toByteArray())
+        bobSession.adoptPeerRatchetKey(headerDh)
+
+        var failed = false
+        try {
+            bobSession.decrypt(frame)
+        } catch (e: Exception) {
+            failed = true
+        }
+        assertTrue(
+            "different aad on the two sides must fail authentication — " +
+                "this is the bug that broke every real message while tests stayed green",
+            failed,
+        )
+    }
+
+    @Test
+    fun `a constant aad round trips, which is what the app now uses`() {
+        val alice = Peer("alice")
+        val bob = Peer("bob")
+
+        val bobBundle = PrekeyBundle.fromBase64Json(bob.publishedJson())!!
+        val secret = "same aad both sides"
+        val aad = "HUSH/msg/v1".toByteArray()
+
+        val initiator = X3dh.initiate(alice.identity, bobBundle)
+        val aliceSession = DoubleRatchet.create(initiator, aad)
+        val frame = aliceSession.encrypt(secret.toByteArray())
+        val headerDh = frame.copyOfRange(0, DoubleRatchet.DH_KEY_LEN)
+
+        val responder = X3dh.respond(
+            identityKey = bob.identity,
+            signedPrekey = SignedPrekey(
+                bob.signed.privateKey, bob.signed.publicKey, bob.counter, bob.signature,
+            ),
+            remoteIdentityPublic = alice.identity.publicKey,
+            remoteEphemeralPublic = headerDh,
+        )
+        val bobSession = DoubleRatchet.create(responder, aad)
+        bobSession.adoptPeerRatchetKey(headerDh)
+
+        val plaintext = bobSession.decrypt(frame)
+        assertNotNull("same aad on both sides must decrypt", plaintext)
+        assertTrue(String(plaintext!!) == secret)
     }
 }

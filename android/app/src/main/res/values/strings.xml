@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">HUSH</string>
+
+    <string name="channel_call">Active call</string>
+    <string name="channel_call_description">Shows while a HUSH call is in progress</string>
+    <string name="channel_messages">Messages</string>
+    <string name="channel_messages_description">Alerts for new messages</string>
+
+    <string name="onboarding_title">HUSH</string>
+    <string name="onboarding_subtitle">Private messenger. No account, no phone number, no email.</string>
+    <string name="onboarding_name_label">Display name</string>
+    <string name="onboarding_name_hint">Anyone can pick this. It is not an identity.</string>
+    <string name="onboarding_continue">Continue</string>
+    <string name="onboarding_privacy_note">Messages are end-to-end encrypted. The relay routes ciphertext it cannot read, and keeps no history.</string>
+</resources>

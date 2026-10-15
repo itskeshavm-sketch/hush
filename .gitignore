@@ -1,0 +1,41 @@
+# Build outputs
+dist/
+build/
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# Gradle
+.gradle/
+gradle-app.setting
+local.properties
+
+# Signing material — never commit a keystore or its passwords
+keystore.properties
+*.jks
+*.keystore
+
+# Relay TLS material. A self-signed relay key is a secret: anyone holding it
+# plus the certificate can impersonate the relay to a client that has not
+# pinned yet.
+server/certs/
+*.pem
+*.key
+*.crt
+*.p12
+
+# Node
+node_modules/
+npm-debug.log*
+.npm/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.kotlin/
+
+# OS
+.DS_Store
+Thumbs.db

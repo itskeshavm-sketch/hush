@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  HUSH mark: a closed padlock silhouette inside the adaptive-icon safe zone.
+
+  The safe zone for an adaptive icon foreground is the centre 66dp of a 108dp
+  canvas, so artwork is drawn within roughly x/y 21..87. Anything outside that
+  gets cropped to a circle on many launchers.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Shackle: open arc, stroke only. -->
+    <path
+        android:pathData="M42,52 L42,44 A12,12 0 0 1 66,44 L66,52"
+        android:strokeColor="#7C5CFF"
+        android:strokeWidth="5"
+        android:strokeLineCap="round" />
+
+    <!-- Body: rounded block. -->
+    <path
+        android:pathData="M36,50 L72,50 A5,5 0 0 1 77,55 L77,74 A5,5 0 0 1 72,79 L36,79 A5,5 0 0 1 31,74 L31,55 A5,5 0 0 1 36,50 Z"
+        android:fillColor="#7C5CFF" />
+
+    <!-- Keyhole, punched in the surface colour. -->
+    <path
+        android:pathData="M54,60 A4,4 0 1 1 54,68 A4,4 0 1 1 54,60 Z"
+        android:fillColor="#0B0C10" />
+    <path
+        android:pathData="M52.5,66 L55.5,66 L56.5,74 L51.5,74 Z"
+        android:fillColor="#0B0C10" />
+</vector>

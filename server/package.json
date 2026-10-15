@@ -1,0 +1,21 @@
+{
+  "name": "hush-relay",
+  "version": "1.0.0",
+  "description": "HUSH — zero-log E2E chat relay. Routes ciphertext it cannot read.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "private": true,
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "test": "node --test test/",
+    "genkey": "node tools/genkey.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

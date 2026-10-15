@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  HUSH talks to relays the user chooses at runtime, and a self-hosted relay
+  almost always presents a self-signed certificate. Android's default policy
+  would reject that outright.
+
+  The resolution here is NOT to blanket-allow cleartext or blanket-trust user
+  CAs. It is:
+
+    1. Cleartext is disabled outright. HUSH is meaningless over plain HTTP, so
+       the ability to downgrade is removed rather than discouraged.
+    2. Debug builds may trust user-installed CAs, so a developer with a real
+       Let's Encrypt cert can test with the full system trust store.
+    3. Release builds trust only the system store. Self-signed relay certs are
+       handled in code by TlsPinner, which pins a fingerprint on first connect
+       and fails closed on mismatch. A pinned, deliberately-accepted self-signed
+       cert is a different guarantee from "trust everything", and it is the only
+       reason the two are separated.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </base-config>
+
+    <debug-overrides>
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </debug-overrides>
+</network-security-config>

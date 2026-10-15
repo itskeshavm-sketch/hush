@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<!--
+  HUSH web client.
+
+  A thin shim over the same relay protocol the Android app speaks, so a second
+  implementation exercises the protocol and a relay deployment is a complete
+  single-process package.
+
+  Cryptography caveat, stated on screen in the app as well: this build uses the
+  Web Crypto API for X25519-style key agreement is NOT available in browsers
+  for the raw form used here, so the web client ships as a *transport and UI
+  client only*. It is fully usable for a smoke test of a relay's behaviour, and
+  the UI says so rather than pretending to be encrypted.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>HUSH</title>
+<style>
+  :root {
+    --bg: #0B0C10;
+    --surface: #13151C;
+    --elevated: #1B1E27;
+    --accent: #7C5CFF;
+    --text: #EDEFF5;
+    --dim: #9AA0B4;
+    --faint: #6B7183;
+    --online: #3DDC97;
+    --danger: #FF5C68;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%;
+    background: var(--bg); color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  #app { display: flex; flex-direction: column; height: 100%; max-width: 720px; margin: 0 auto; }
+
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 16px 20px; border-bottom: 1px solid var(--elevated);
+    position: sticky; top: 0; background: var(--bg); z-index: 2;
+  }
+  .mark {
+    width: 34px; height: 34px; border-radius: 10px; background: var(--accent);
+    display: grid; place-items: center; font-weight: 700; font-size: 15px; color: #fff;
+  }
+  .title { font-weight: 700; letter-spacing: 2px; }
+  .sub { font-size: 12px; color: var(--faint); }
+
+  .status { margin-left: auto; font-size: 12px; color: var(--dim); display: flex; align-items: center; gap: 6px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); }
+  .dot.on { background: var(--online); }
+
+  main { flex: 1; overflow-y: auto; }
+
+  .banner {
+    padding: 9px 20px; font-size: 13px;
+    background: rgba(255,92,104,.12); color: var(--danger);
+  }
+  .banner.hidden { display: none; }
+
+  .list { list-style: none; margin: 0; padding: 0; }
+  .row {
+    display: flex; align-items: center; gap: 14px;
+    padding: 11px 20px; cursor: pointer; border-bottom: 1px solid rgba(255,255,255,.03);
+  }
+  .row:hover { background: var(--surface); }
+  .avatar {
+    width: 42px; height: 42px; border-radius: 50%;
+    display: grid; place-items: center; font-weight: 700; font-size: 15px;
+    background: rgba(124,92,255,.18); color: #a68fff; border: 1px solid rgba(124,92,255,.35);
+    position: relative; flex-shrink: 0;
+  }
+  .avatar .presence {
+    position: absolute; right: -1px; bottom: -1px;
+    width: 11px; height: 11px; border-radius: 50%;
+    background: var(--faint); border: 2px solid var(--bg);
+  }
+  .avatar .presence.on { background: var(--online); }
+  .meta { min-width: 0; flex: 1; }
+  .name { font-weight: 600; }
+  .preview { font-size: 13px; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  .empty { padding: 56px 40px; text-align: center; color: var(--dim); }
+  .empty h3 { color: var(--text); margin: 0 0 8px; font-size: 16px; }
+
+  footer {
+    display: flex; gap: 10px; padding: 12px 16px;
+    border-top: 1px solid var(--elevated); background: var(--surface);
+  }
+  input {
+    flex: 1; padding: 12px 16px; border-radius: 22px;
+    background: var(--elevated); border: 1px solid transparent; color: var(--text);
+    font: inherit; outline: none; min-width: 0;
+  }
+  input:focus { border-color: var(--accent); }
+  button {
+    padding: 12px 20px; border-radius: 22px; border: 0;
+    background: var(--accent); color: #fff; font: inherit; font-weight: 600; cursor: pointer;
+  }
+  button:disabled { background: var(--elevated); color: var(--faint); cursor: default; }
+  button.ghost { background: transparent; color: var(--dim); border: 1px solid var(--elevated); }
+
+  .setup { padding: 40px 28px; }
+  .setup label { display: block; font-size: 12px; color: var(--faint); margin: 18px 0 6px; }
+  .setup input { width: 100%; border-radius: 12px; }
+  .setup button { width: 100%; margin-top: 22px; border-radius: 12px; height: 50px; }
+  .note { font-size: 13px; color: var(--faint); margin-top: 22px; line-height: 1.6; }
+  .warn {
+    margin-top: 24px; padding: 12px 14px; border-radius: 12px;
+    background: rgba(255,176,32,.1); color: #ffb020; font-size: 13px; line-height: 1.5;
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <div class="mark">H</div>
+    <div>
+      <div class="title">HUSH</div>
+      <div class="sub" id="who">not connected</div>
+    </div>
+    <div class="status"><span class="dot" id="dot"></span><span id="state">offline</span></div>
+  </header>
+
+  <div class="banner hidden" id="banner"></div>
+
+  <main id="main"></main>
+
+  <footer id="composer" class="hidden">
+    <input id="text" placeholder="Message" autocomplete="off" />
+    <button id="send" disabled>Send</button>
+  </footer>
+</div>
+
+<script type="module">
+/*
+ * Minimal relay client. Mirrors android/.../net/RelayClient.kt frame-for-frame
+ * so a protocol change breaks one of the two, not silently both.
+ */
+const $ = (id) => document.getElementById(id);
+
+const state = {
+  ws: null,
+  name: localStorage.getItem('hush.name') || '',
+  id: null,
+  peers: new Map(),
+  active: null,
+  messages: new Map(),
+  backoff: 1000,
+};
+
+const b64 = {
+  encode: (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))),
+  decode: (str) => Uint8Array.from(atob(str), (c) => c.charCodeAt(0)),
+};
+
+// --- crypto stub -----------------------------------------------------------
+// A real build swaps this for the same X3DH + Double Ratchet as the Android
+// client. What ships here is deliberately NOT encryption: pretending
+// otherwise in a demo would be worse than saying so.
+const crypto_ = {
+  identityKey: crypto.getRandomValues(new Uint8Array(32)),
+  get publicKey() { return this.identityKey; },
+  seal(plaintext) {
+    // Obfuscation only. It keeps the relay's traffic opaque to a casual
+    // reader of the wire format and nothing more.
+    const key = this.identityKey;
+    const out = new Uint8Array(plaintext.length);
+    for (let i = 0; i < plaintext.length; i++) out[i] = plaintext[i] ^ key[i % 32];
+    return out;
+  },
+  open(cipher) {
+    const key = this.identityKey;
+    const out = new Uint8Array(cipher.length);
+    for (let i = 0; i < cipher.length; i++) out[i] = cipher[i] ^ key[i % 32];
+    return out;
+  },
+  prekeyBundle() {
+    return JSON.stringify({
+      identity: b64.encode(this.identityKey),
+      prekey: b64.encode(crypto.getRandomValues(new Uint8Array(32))),
+      signedPrekey: {
+        key: b64.encode(crypto.getRandomValues(new Uint8Array(32))),
+        sig: b64.encode(crypto.getRandomValues(new Uint8Array(64))),
+        counter: 0,
+      },
+    });
+  },
+};
+
+// --- rendering -------------------------------------------------------------
+function renderSetup(relayUrl) {
+  $('main').innerHTML = `
+    <div class="setup">
+      <h2>Connect to a relay</h2>
+      <label for="relay">Relay address</label>
+      <input id="relay" value="${relayUrl}" />
+      <label for="nick">Display name</label>
+      <input id="nick" value="${state.name}" placeholder="Alex" maxlength="32" />
+      <button id="go">Continue</button>
+      <p class="note">HUSH has no accounts. The display name is a label, not an identity — anyone can claim any name.</p>
+      <div class="warn"><strong>Development client.</strong> This web build obfuscates traffic but does not implement the X3DH + Double Ratchet session that the Android app uses. Use the Android app when the message content matters.</div>
+    </div>`;
+
+  $('go').onclick = () => {
+    const name = $('nick').value.trim();
+    const relay = $('relay').value.trim();
+    if (!name || !relay) return;
+    localStorage.setItem('hush.name', name);
+    localStorage.setItem('hush.relay', relay);
+    state.name = name;
+    connect(relay);
+  };
+}
+
+function renderRoster() {
+  const peers = [...state.peers.values()].sort(
+    (a, b) => Number(b.online) - Number(a.online) || a.name.localeCompare(b.name)
+  );
+
+  $('main').innerHTML = peers.length
+    ? `<ul class="list">${peers.map((p) => `
+        <li class="row" data-id="${p.id}">
+          <div class="avatar">${esc(initials(p.name))}
+            <span class="presence ${p.online ? 'on' : ''}"></span>
+          </div>
+          <div class="meta">
+            <div class="name">${esc(p.name)}</div>
+            <div class="preview">${p.online ? 'online' : 'offline'}</div>
+          </div>
+        </li>`).join('')}</ul>`
+    : `<div class="empty">
+         <h3>Nobody else is here yet</h3>
+         <p>Open this page in another browser or device pointed at the same relay, and they will appear here.</p>
+       </div>`;
+
+  $('main').querySelectorAll('.row').forEach((row) => {
+    row.onclick = () => openChat(row.dataset.id);
+  });
+}
+
+function renderChat() {
+  const peer = state.peers.get(state.active);
+  if (!peer) return;
+
+  const thread = state.messages.get(peer.id) || [];
+  $('main').innerHTML = `
+    <ul class="list">
+      <li class="row" id="back">← <div class="name">${esc(peer.name)}</div></li>
+      ${thread.length
+        ? thread.map((m) => `
+            <li class="row" style="cursor:default">
+              <div class="avatar" style="width:28px;height:28px;font-size:11px">${esc(initials(m.mine ? 'me' : peer.name))}</div>
+              <div class="meta"><div class="preview" style="white-space:pre-wrap;color:var(--text)">${esc(m.text)}</div></div>
+              <div class="preview">${m.mine ? '' : ''}</div>
+            </li>`).join('')
+        : `<li class="row" style="cursor:default"><div class="preview">No messages yet.</div></li>`}
+    </ul>`;
+
+  $('back').onclick = () => { state.active = null; renderRoster(); };
+}
+
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+const initials = (name) =>
+  String(name || '?').trim().split(/\s+/).slice(0, 2).map((w) => w[0]).join('').toUpperCase() || '?';
+
+function openChat(id) {
+  state.active = id;
+  $('composer').classList.remove('hidden');
+  renderChat();
+}
+
+// --- connection ------------------------------------------------------------
+function setState(label, online) {
+  $('state').textContent = label;
+  $('dot').classList.toggle('on', online);
+  $('who').textContent = online ? state.name : 'not connected';
+}
+
+function connect(relay) {
+  const url = relay.replace(/^http/, 'ws').replace(/\/$/, '') + '/ws';
+  const ws = new WebSocket(url);
+  state.ws = ws;
+
+  ws.onopen = () => {
+    state.backoff = 1000;
+    send({
+      t: 'hello',
+      name: state.name,
+      identityPub: b64.encode(crypto_.publicKey),
+      prekey: crypto_.prekeyBundle(),
+    });
+  };
+
+  ws.onmessage = (ev) => {
+    const f = JSON.parse(ev.data);
+    switch (f.t) {
+      case 'welcome':
+        state.id = f.you.id;
+        setState('connected', true);
+        $('banner').classList.add('hidden');
+        applyRoster(f.peers);
+        $('composer').classList.add('hidden');
+        renderRoster();
+        break;
+
+      case 'roster':
+        applyRoster(f.peers);
+        state.active ? renderChat() : renderRoster();
+        break;
+
+      case 'msg': {
+        if (f.kind === 'rtc') break; // web build does not do calls
+        const text = new TextDecoder().decode(crypto_.open(b64.decode(f.envelope)));
+        const thread = state.messages.get(f.from) || [];
+        thread.push({ text, mine: false });
+        state.messages.set(f.from, thread);
+        state.active === f.from ? renderChat() : renderRoster();
+        break;
+      }
+
+      case 'delete': {
+        const thread = state.messages.get(f.to) || [];
+        state.messages.set(f.to, thread.filter((m) => m.id !== f.msgId));
+        renderChat();
+        break;
+      }
+
+      case 'error':
+        showBanner(f.message || 'relay error');
+        break;
+    }
+  };
+
+  ws.onclose = () => {
+    setState('offline', false);
+    // Exponential backoff with jitter, so every client dropped by a relay
+    // restart does not return in lockstep.
+    const delay = state.backoff / 2 + Math.random() * (state.backoff / 2);
+    state.backoff = Math.min(60000, state.backoff * 2);
+    setTimeout(() => connect(relay), delay);
+  };
+
+  ws.onerror = () => ws.close();
+}
+
+function applyRoster(peers) {
+  const self = state.id;
+  state.peers = new Map(peers.filter((p) => p.id !== self).map((p) => [p.id, p]));
+}
+
+function send(obj) {
+  if (state.ws?.readyState === WebSocket.OPEN) state.ws.send(JSON.stringify(obj));
+}
+
+function showBanner(text) {
+  const b = $('banner');
+  b.textContent = text;
+  b.classList.remove('hidden');
+}
+
+// --- composer --------------------------------------------------------------
+$('text').addEventListener('input', (e) => { $('send').disabled = !e.target.value.trim(); });
+$('text').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('send').click(); });
+
+$('send').onclick = () => {
+  const input = $('text');
+  const text = input.value.trim();
+  if (!text || !state.active) return;
+
+  const sealed = crypto_.seal(new TextEncoder().encode(text));
+  send({ t: 'send', to: state.active, envelope: b64.encode(sealed) });
+
+  const thread = state.messages.get(state.active) || [];
+  thread.push({ text, mine: true, id: null });
+  state.messages.set(state.active, thread);
+
+  input.value = '';
+  $('send').disabled = true;
+  renderChat();
+};
+
+// --- boot ------------------------------------------------------------------
+if (state.name && localStorage.getItem('hush.relay')) {
+  connect(localStorage.getItem('hush.relay'));
+} else {
+  renderSetup(localStorage.getItem('hush.relay') || 'wss://localhost:8443/ws');
+  setState('offline', false);
+}
+</script>
+</body>
+</html>

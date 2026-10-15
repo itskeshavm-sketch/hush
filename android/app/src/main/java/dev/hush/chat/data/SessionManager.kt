@@ -7,6 +7,7 @@ import dev.hush.chat.crypto.Identity
 import dev.hush.chat.crypto.KeyPair
 import dev.hush.chat.crypto.Primitives
 import dev.hush.chat.crypto.PrekeyBundle
+import dev.hush.chat.crypto.RatchetException
 import dev.hush.chat.crypto.SignedPrekey
 import dev.hush.chat.crypto.SignedPrekeyPublic
 import dev.hush.chat.crypto.X3dh
@@ -32,6 +33,24 @@ sealed interface InboundResult {
     data object Ignored : InboundResult
 
     data class Failed(val conversationId: String, val reason: String) : InboundResult
+
+    /**
+     * The sender is not speaking the app protocol at all.
+     *
+     * Two concrete cases, both of which used to surface as the generic
+     * "Could not decrypt a message from X":
+     *
+     *  - the browser preview client, which XOR-obfuscates instead of running
+     *    X3DH + Double Ratchet, and whose prekey bundle carries a random
+     *    signature that fails verification by design;
+     *  - relay-level test probes, which send raw envelopes with random
+     *    signatures for the same reason.
+     *
+     * Neither can ever decrypt against this device, no matter how many times
+     * the session is reset, so the UI must say that instead of implying a
+     * transient failure.
+     */
+    data class Incompatible(val conversationId: String, val reason: String) : InboundResult
 }
 
 /**
@@ -284,22 +303,45 @@ class SessionManager(private val context: Context) {
     fun decrypt(peerId: String, peerPrekeyJson: String?, payload: ByteArray, kind: String = "msg"): InboundResult {
         val lock = locks.computeIfAbsent(peerId) { ReentrantLock() }
         return lock.withLock {
+            // A ratchet frame is HEADER(40) + NONCE(24) + TAG(16) at minimum.
+            // Anything shorter is not a failed decryption — it is a different
+            // protocol. The browser preview sends short XOR envelopes; trying
+            // to X3DH-respond to those would either crash on a short header
+            // slice or poison the session with a garbage root key.
+            if (payload.size < DoubleRatchet.HEADER_LEN + Primitives.NONCE_LEN + DoubleRatchet.MAC_LEN) {
+                return InboundResult.Incompatible(peerId, "payload too short to be an app message (${payload.size} bytes)")
+            }
+
             val existing = sessions[peerId]
             if (existing != null) {
                 return try {
                     val plaintext = existing.decrypt(payload) ?: return InboundResult.Ignored
                     interpret(peerId, String(plaintext), kind)
-                } catch (e: dev.hush.chat.crypto.RatchetException) {
+                } catch (e: RatchetException) {
                     Log.w(TAG, "decrypt failed for $peerId: ${e.message}")
                     InboundResult.Failed(peerId, e.message ?: "decryption failed")
+                } catch (e: Exception) {
+                    // DoubleRatchet.decrypt uses require() for structural
+                    // problems, which throws IllegalArgumentException rather
+                    // than RatchetException. Letting that escape would crash
+                    // the frame collector; a malformed frame is a failed
+                    // message, never a crash.
+                    Log.w(TAG, "decrypt malformed frame for $peerId: ${e.message}")
+                    InboundResult.Failed(peerId, e.message ?: "malformed frame")
                 }
             }
 
             // First contact from them: we may still be the initiator if they
             // messaged first, so build the responder session.
+            //
+            // A null bundle here almost always means the sender is the browser
+            // preview or a test probe: both publish bundles with random
+            // signatures that fail verification by design. Reporting that as a
+            // generic decrypt failure sends the user chasing a key mismatch
+            // that does not exist.
             val bundle = peerPrekeyJson?.let { PrekeyBundle.fromBase64Json(it) }
             if (bundle == null) {
-                return InboundResult.Failed(peerId, "no prekey bundle to establish a session")
+                return InboundResult.Incompatible(peerId, "no verifiable app prekey bundle")
             }
 
             val identity = requireNotNull(identity) { "identity not loaded" }
@@ -309,7 +351,10 @@ class SessionManager(private val context: Context) {
             // ratchet at that same key so the first dhRatchet step lines up.
             // Only the DH *field* — 32 bytes — is the X3DH ephemeral. The rest
             // of the header is chain counters, not key material.
-            val headerDh = payload.copyOfRange(0, DoubleRatchet.DH_KEY_LEN.coerceAtMost(payload.size))
+            //
+            // The length check above guarantees payload.size >= 80, so this
+            // slice is always a full 32 bytes.
+            val headerDh = payload.copyOfRange(0, DoubleRatchet.DH_KEY_LEN)
 
             // The signed prekey handed to `respond` MUST be the one this device
             // published in its bundle — private half included.
@@ -322,17 +367,22 @@ class SessionManager(private val context: Context) {
             // comment warning that generating a fresh key here makes the first
             // message permanently undecryptable; the caller did exactly that.
             val local = localBundle()
-            val initial = X3dh.respond(
-                identity.identityKey,
-                SignedPrekey(
-                    privateKey = local.signedPrivate.copyOf(),
-                    publicKey = local.signedPublic,
-                    counter = local.counter,
-                    signature = local.signature,
-                ),
-                identity.identityPublic,
-                headerDh,
-            )
+            val initial = try {
+                X3dh.respond(
+                    identity.identityKey,
+                    SignedPrekey(
+                        privateKey = local.signedPrivate.copyOf(),
+                        publicKey = local.signedPublic,
+                        counter = local.counter,
+                        signature = local.signature,
+                    ),
+                    identity.identityPublic,
+                    headerDh,
+                )
+            } catch (e: Exception) {
+                Log.w(TAG, "x3dh respond failed for $peerId: ${e.message}")
+                return InboundResult.Failed(peerId, "key agreement failed")
+            }
             val session = DoubleRatchet.create(initial, aadFor(peerId))
             session.adoptPeerRatchetKey(headerDh)
             sessions[peerId] = session
@@ -340,8 +390,11 @@ class SessionManager(private val context: Context) {
             try {
                 val plaintext = session.decrypt(payload) ?: return InboundResult.Ignored
                 interpret(peerId, String(plaintext), kind)
-            } catch (e: dev.hush.chat.crypto.RatchetException) {
+            } catch (e: RatchetException) {
                 InboundResult.Failed(peerId, e.message ?: "decryption failed")
+            } catch (e: Exception) {
+                Log.w(TAG, "first-contact decrypt malformed for $peerId: ${e.message}")
+                InboundResult.Failed(peerId, e.message ?: "malformed frame")
             }
         }
     }

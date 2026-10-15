@@ -227,6 +227,14 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
                 )
             }
         )
+        // Peers the relay no longer reports are offline, not gone — except rows
+        // with no conversation history at all, which are roster cruft (a device
+        // that happened to be online while a test probe connected, for
+        // example) and are deleted outright. Without this, names like the
+        // throwaway test bots linger on the device that saw them and never on
+        // a device installed later, which reads as "I see people my phone
+        // doesn't" and is indistinguishable from a sync bug.
+        store.reconcilePeers(others.map { it.id })
         _peers.value = store.loadPeers()
     }
 
@@ -273,10 +281,22 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
             _messages.value = store.loadMessages(peerId)
 
             val peer = _peers.value.firstOrNull { it.id == peerId }
-            val sealed = sessions.encrypt(peerId, peer?.let { prekeyFor(peerId) }, text.toByteArray())
+            val bundleJson = peer?.let { prekeyFor(peerId) }
+            val sealed = sessions.encrypt(peerId, bundleJson, text.toByteArray())
             if (sealed == null) {
                 store.updateState(id, DeliveryState.FAILED)
-                emitToast("Can't reach ${peer?.displayName ?: "peer"} yet — message held")
+                // Null bundle means they never published (still connecting).
+                // Non-null but unencryptable means the bundle fails
+                // verification — a browser preview or test client that can
+                // never read an app message, not someone who is merely offline.
+                if (bundleJson != null) {
+                    emitToast(
+                        "${peer?.displayName ?: "That peer"} is using the browser preview " +
+                            "or a test client, which can't read app messages",
+                    )
+                } else {
+                    emitToast("Can't reach ${peer?.displayName ?: "peer"} yet — message held")
+                }
             } else if (relay.sendMessage(peerId, sealed)) {
                 store.updateState(id, DeliveryState.SENT)
             } else {
@@ -363,8 +383,33 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
                 // A ratchet failure means the session is desynchronised. Drop
                 // it so the next message re-establishes from scratch rather
                 // than failing forever.
+                //
+                // Both sides must run the build with stable prekey bundles for
+                // this to heal: if the sender is still on the build that wipes
+                // its private halves, no number of resets on this side will
+                // help, and the toast says so instead of implying a retry will
+                // fix it.
                 sessions.resetSession(from)
-                emitToast("Could not decrypt a message from $fromName")
+                if (shouldToast("fail:$from")) {
+                    emitToast(
+                        "Could not decrypt a message from $fromName — " +
+                            "make sure both of you updated to the latest install",
+                    )
+                }
+            }
+            is dev.hush.chat.data.InboundResult.Incompatible -> {
+                // The sender is not speaking the app protocol: the browser
+                // preview (XOR envelopes, random bundle signatures) or a relay
+                // test probe. Resetting cannot help — there is no session to
+                // heal — so say what it is, throttled, and move on without
+                // storing a poisoned session.
+                sessions.resetSession(from)
+                if (!shouldToast("incompat:$from")) return
+                val name = fromName.ifEmpty { "that peer" }
+                emitToast(
+                    "$name is using the browser preview or a test client, " +
+                        "which can't exchange encrypted messages with the app",
+                )
             }
             dev.hush.chat.data.InboundResult.Ignored -> Unit
         }
@@ -448,6 +493,22 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
 
     fun emitToast(text: String) {
         _toast.value = Toast(text)
+    }
+
+    /**
+     * One toast per key per minute.
+     *
+     * A peer that cannot speak the protocol fails *every* message, and without
+     * this the UI is a solid wall of identical toasts. Returns true when the
+     * caller should show, false when this one should be swallowed.
+     */
+    private val lastToastAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private fun shouldToast(key: String): Boolean {
+        val now = System.currentTimeMillis()
+        val last = lastToastAt[key] ?: 0L
+        if (now - last < 60_000L) return false
+        lastToastAt[key] = now
+        return true
     }
 
     fun consumeToast() {

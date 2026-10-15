@@ -196,6 +196,56 @@ class HushStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
         }
     }
 
+    /**
+     * Reconcile the local peer table with a fresh roster.
+     *
+     * Two problems this exists to fix, both observed in the field:
+     *
+     *  1. Ghosts that never leave. `upsertPeers` only ever inserts or replaces,
+     *     so a peer that disconnects stays `online = 1` forever. Worse, relay
+     *     test probes with throwaway names ended up permanently listed on a
+     *     real device that happened to be online during the test.
+     *
+     *  2. Unbounded growth. A reinstall mints a new identity, which means a new
+     *     peer id for the same human. The old row would linger as a second,
+     *     permanently offline entry with the same display name.
+     *
+     * Rows that have conversation history are kept and marked offline — history
+     * must never be garbage-collected out from under the user. Rows with no
+     * messages at all are roster cruft and are deleted outright.
+     */
+    suspend fun reconcilePeers(liveIds: List<String>) = withContext(Dispatchers.IO) {
+        ioLock.write {
+            val db = writableDatabase
+            db.beginTransaction()
+            try {
+                if (liveIds.isEmpty()) {
+                    db.execSQL("UPDATE peers SET online = 0")
+                    db.execSQL(
+                        "DELETE FROM peers WHERE id NOT IN (SELECT DISTINCT conversation_id FROM messages)",
+                    )
+                } else {
+                    val placeholders = liveIds.joinToString(",") { "?" }
+                    db.execSQL(
+                        "UPDATE peers SET online = 0 WHERE id NOT IN ($placeholders)",
+                        liveIds.toTypedArray(),
+                    )
+                    db.execSQL(
+                        """
+                        DELETE FROM peers
+                        WHERE id NOT IN ($placeholders)
+                          AND id NOT IN (SELECT DISTINCT conversation_id FROM messages)
+                        """.trimIndent(),
+                        liveIds.toTypedArray(),
+                    )
+                }
+                db.setTransactionSuccessful()
+            } finally {
+                db.endTransaction()
+            }
+        }
+    }
+
     suspend fun loadPeers(): List<Peer> = withContext(Dispatchers.IO) {
         ioLock.read {
             readableDatabase.rawQuery(

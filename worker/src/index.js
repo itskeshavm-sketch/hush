@@ -40,6 +40,9 @@ import {
 /** Presence broadcasts are debounced so a burst of joins is one fan-out. */
 const PRESENCE_DEBOUNCE_MS = 120;
 
+/** Storage key prefix for one peer's record. */
+const PEER_KEY = "peer:";
+
 /**
  * Worker entry point.
  *
@@ -82,8 +85,19 @@ export class HushRelay extends DurableObject {
     super(state, env);
     this.state = state;
 
-    /** @type {Map<string, { ws: WebSocket, name: string, identityPub: string, prekey: any, bio: string, joinedAt: number }>} */
-    this.peers = new Map();
+    // There is deliberately no `this.peers` registry here.
+    //
+    // An earlier version kept the roster in a Map on the instance. That looks
+    // fine right up until Cloudflare evicts the isolate to save memory, which is
+    // exactly what the Hibernation API is for: the WebSocket survives, anything
+    // hung off `this` does not. The observable symptom was an app that stayed
+    // connected — socket state OPEN, no errors — while the relay reported zero
+    // peers, so every client saw an empty "nobody else is here" list and could
+    // not message anyone. It was intermittent because eviction is not on a
+    // timer you control, which is what made it look like a UI bug.
+    //
+    // Peer records now live in DO storage and are reached through
+    // `ctx.getWebSockets()`, both of which are defined to outlive an eviction.
 
     this.presenceQueued = false;
   }
@@ -96,11 +110,16 @@ export class HushRelay extends DurableObject {
     const url = new URL(request.url);
 
     if (url.pathname === "/health") {
+      const roster = await this.#roster();
       return json({
         service: "hush-relay",
         runtime: "cloudflare-worker",
         protocol: PROTOCOL_VERSION,
-        peers: this.peers.size,
+        peers: roster.length,
+        // Names, not just a count. A count that reads 0 while a client sits
+        // there connected is exactly the failure this endpoint exists to make
+        // visible.
+        names: roster.map((p) => p.name),
         note: "zero-retention relay — no message content, no history, no accounts",
       });
     }
@@ -137,9 +156,13 @@ export class HushRelay extends DurableObject {
   async webSocketMessage(ws, raw) {
     const text = typeof raw === "string" ? raw : new TextDecoder().decode(raw);
 
+    // Resolved once and reused. Three storage reads for the same value was
+    // three chances to observe a different answer.
+    const peer = await this.#peerFor(ws);
+
     const parsed = parseInbound(text, {
-      hasJoined: this.#peerFor(ws) !== null,
-      selfId: this.#peerFor(ws)?.id ?? null,
+      hasJoined: peer !== null,
+      selfId: peer?.id ?? null,
     });
 
     if (!parsed.ok) {
@@ -147,7 +170,7 @@ export class HushRelay extends DurableObject {
       return;
     }
 
-    this.#dispatch(parsed.frame, this.#peerFor(ws), ws);
+    await this.#dispatch(parsed.frame, peer, ws);
   }
 
   /**
@@ -155,21 +178,18 @@ export class HushRelay extends DurableObject {
    * the isolate having to be alive to notice a dropped TCP connection.
    */
   async webSocketClose(ws) {
-    const peer = this.#peerFor(ws);
-    if (!peer) return;
-    this.peers.delete(peer.id);
-    this.#queuePresence();
+    await this.#close(ws);
   }
 
   async webSocketError(ws) {
-    this.#close(ws);
+    await this.#close(ws);
   }
 
   // -------------------------------------------------------------------------
   // Dispatch
   // -------------------------------------------------------------------------
 
-  #dispatch(frame, peer, ws) {
+  async #dispatch(frame, peer, ws) {
     switch (frame.t) {
       case "ping":
         this.#send(ws, { t: "pong", at: Date.now() });
@@ -180,22 +200,24 @@ export class HushRelay extends DurableObject {
           this.#send(ws, { t: "error", code: ERROR_CODES.ALREADY_JOINED, message: "already joined" });
           return;
         }
-        if (this.peers.size >= MAX_ROSTER) {
+        // Capacity is counted from live sockets, which is the only count that
+        // cannot drift once a record outlives its connection.
+        if (this.ctx.getWebSockets().length >= MAX_ROSTER) {
           this.#send(ws, { t: "error", code: ERROR_CODES.RATE_LIMIT, message: "relay at capacity" });
           return;
         }
-        this.#join(frame, ws);
+        await this.#join(frame, ws);
         this.#queuePresence();
         return;
       }
 
       case "roster":
-        this.#send(ws, this.#rosterFrame());
+        this.#send(ws, await this.#rosterFrame());
         return;
 
       case "profile":
         if (peer) {
-          peer.bio = frame.bio;
+          await this.state.storage.put(PEER_KEY + peer.id, { ...peer, bio: frame.bio });
           this.#queuePresence();
         }
         return;
@@ -203,7 +225,7 @@ export class HushRelay extends DurableObject {
       case "send":
       case "rtc": {
         if (!peer) return;
-        const target = this.peers.get(frame.to);
+        const target = this.#socketFor(frame.to);
         if (!target) {
           this.#send(ws, {
             t: "error",
@@ -214,7 +236,7 @@ export class HushRelay extends DurableObject {
         }
         // `kind` tells the client whether to route this to the chat pipeline
         // or to WebRTC signaling. It reveals nothing about the ciphertext.
-        this.#send(target.ws, {
+        this.#send(target, {
           t: "msg",
           from: peer.id,
           fromName: peer.name,
@@ -227,7 +249,7 @@ export class HushRelay extends DurableObject {
 
       case "delete": {
         if (!peer) return;
-        const target = this.peers.get(frame.to);
+        const target = this.#socketFor(frame.to);
         if (!target) {
           this.#send(ws, {
             t: "error",
@@ -236,7 +258,7 @@ export class HushRelay extends DurableObject {
           });
           return;
         }
-        this.#send(target.ws, {
+        this.#send(target, {
           t: "delete",
           by: peer.id,
           byName: peer.name,
@@ -250,10 +272,10 @@ export class HushRelay extends DurableObject {
 
       case "typing": {
         if (!peer) return;
-        const target = this.peers.get(frame.to);
+        const target = this.#socketFor(frame.to);
         // Fire and forget: no error frame for an offline typing target.
         if (!target) return;
-        this.#send(target.ws, { t: "typing", from: peer.id, fromName: peer.name, state: frame.state });
+        this.#send(target, { t: "typing", from: peer.id, fromName: peer.name, state: frame.state });
         return;
       }
 
@@ -262,18 +284,21 @@ export class HushRelay extends DurableObject {
     }
   }
 
-  #join(frame, ws) {
+  async #join(frame, ws) {
     // Route key derived server-side from the identity key, so a client cannot
     // claim another peer's id.
     const id = `p_${frame.identityPub.slice(0, 22)}`;
 
-    const existing = this.peers.get(id);
-    if (existing) {
-      this.peers.delete(id);
-      try {
-        existing.ws.close(4000, "superseded by a newer connection");
-      } catch {
-        /* already gone */
+    // Same identity reconnecting: drop the older socket so the roster never
+    // shows one human twice.
+    for (const other of this.ctx.getWebSockets()) {
+      if (other === ws) continue;
+      if (other.deserializeAttachment()?.id === id) {
+        try {
+          other.close(4000, "superseded by a newer connection");
+        } catch {
+          /* already gone */
+        }
       }
     }
 
@@ -284,14 +309,21 @@ export class HushRelay extends DurableObject {
       prekey: frame.prekey,
       bio: "",
       joinedAt: Date.now(),
-      ws,
     };
-    this.peers.set(id, peer);
+
+    // Durable storage, not instance memory. This is the line the whole bug
+    // turned on.
+    await this.state.storage.put(PEER_KEY + id, peer);
+
+    // The attachment is how a socket is tied back to its record after the
+    // isolate is rebuilt. Without it, a live socket is unattributable and the
+    // relay cannot tell who is online.
+    ws.serializeAttachment({ id });
 
     this.#send(ws, {
       t: "welcome",
       you: this.#record(peer),
-      peers: this.#roster().filter((p) => p.id !== id),
+      peers: (await this.#roster()).filter((p) => p.id !== id),
       serverTime: Date.now(),
       protocol: PROTOCOL_VERSION,
     });
@@ -312,13 +344,45 @@ export class HushRelay extends DurableObject {
 
   async alarm() {
     this.presenceQueued = false;
-    const frame = this.#rosterFrame();
-    for (const peer of this.peers.values()) this.#send(peer.ws, frame);
+    const frame = await this.#rosterFrame();
+    for (const ws of this.ctx.getWebSockets()) this.#send(ws, frame);
   }
 
-  #roster() {
+  /**
+   * The live roster, rebuilt from storage on every call.
+   *
+   * A peer counts as online if and only if an open socket carries its id.
+   * Deriving presence from sockets rather than from a member list is what makes
+   * this self-healing: a record whose socket has gone is simply not reported,
+   * with no dependence on a close event having been delivered first.
+   */
+  async #roster() {
+    const live = new Set();
+    for (const ws of this.ctx.getWebSockets()) {
+      const id = ws.deserializeAttachment()?.id;
+      if (typeof id === "string") live.add(id);
+    }
+    if (live.size === 0) return [];
+
+    // `list({ prefix })` rather than `get([...keys])`.
+    //
+    // This DO uses the SQLite-backed storage class, where a multi-key `get`
+    // returns a **Map**, not an array. Iterating that Map yields `[key, value]`
+    // pairs, so every field read off a "peer" came back undefined and the
+    // roster rendered as rows with no name and no id — while `lastSeen` and
+    // `online` survived, because `#record` computes those locally. A failure
+    // that looks like "the fields I invented are the only ones that work".
+    //
+    // `list` returns a Map on both the KV and SQLite backends, so reading by
+    // key is the one shape that does not depend on which class is deployed.
+    const stored = await this.state.storage.list({ prefix: PEER_KEY });
+
     const out = [];
-    for (const p of this.peers.values()) out.push(this.#record(p));
+    for (const id of live) {
+      const peer = stored.get(PEER_KEY + id);
+      if (peer) out.push(this.#record(peer));
+    }
+
     // Stable ordering, so the "All Users" list does not reshuffle on every
     // refresh. The client sorts anyway; this makes diffing cheap.
     out.sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
@@ -338,37 +402,69 @@ export class HushRelay extends DurableObject {
     };
   }
 
-  #rosterFrame() {
-    return { t: "roster", peers: this.#roster(), serverTime: Date.now() };
+  async #rosterFrame() {
+    return { t: "roster", peers: await this.#roster(), serverTime: Date.now() };
   }
 
   // -------------------------------------------------------------------------
   // WebSocket plumbing
   // -------------------------------------------------------------------------
 
-  #peerFor(ws) {
-    for (const peer of this.peers.values()) {
-      if (peer.ws === ws) return peer;
+  /**
+   * The socket belonging to a peer id, or null.
+   *
+   * Linear over the live sockets. At this roster size that is a handful of
+   * `deserializeAttachment` calls, and unlike a cached map it cannot go stale.
+   */
+  #socketFor(peerId) {
+    if (typeof peerId !== "string" || peerId.length === 0) return null;
+    for (const ws of this.ctx.getWebSockets()) {
+      if (ws.deserializeAttachment()?.id === peerId) return ws;
     }
     return null;
+  }
+
+  /** The stored record for the peer behind this socket, or null. */
+  async #peerFor(ws) {
+    const id = ws.deserializeAttachment()?.id;
+    if (typeof id !== "string") return null;
+    const peer = await this.state.storage.get(PEER_KEY + id);
+    return peer ?? null;
   }
 
   #send(ws, frame) {
     try {
       ws.send(JSON.stringify(frame));
     } catch {
-      // A socket that cannot take a frame is a dead peer; dropping it here
-      // avoids the ghost presence that would otherwise linger until a close
-      // event that may never fire.
-      this.#close(ws);
+      // A socket that cannot take a frame is a dead peer. Closing it makes the
+      // next roster rebuild drop it, which is what prevents ghost presence.
+      //
+      // Deliberately not awaited: `#send` is on the hot path for every frame to
+      // every peer, and making it async to await a cleanup path that only runs
+      // for already-dead sockets would cost a microtask on all of them. The
+      // `.catch` keeps a storage failure here from surfacing as an unhandled
+      // rejection.
+      this.#close(ws).catch(() => {});
     }
   }
 
-  #close(ws) {
-    const peer = this.#peerFor(ws);
-    if (peer) {
-      this.peers.delete(peer.id);
-      this.#queuePresence();
+  /**
+   * Drop a socket's storage record and broadcast the change.
+   *
+   * Async because the record lives in storage. Any caller that must not race
+   * this has to await it — a `webSocketClose` that returns early leaves a
+   * record behind, and presence is derived from sockets rather than records so
+   * the stale record is harmless but still consumes space.
+   */
+  async #close(ws) {
+    try {
+      const id = ws.deserializeAttachment()?.id;
+      if (typeof id === "string") {
+        await this.state.storage.delete(PEER_KEY + id);
+        this.#queuePresence();
+      }
+    } catch {
+      /* nothing to clean up */
     }
     try {
       ws.close();

@@ -124,9 +124,17 @@ fun RosterScreen(
             ConnectionBanner(state = relayState, onRetry = onRetryRelay)
 
             if (peers.isEmpty()) {
+                // Nothing to configure, nothing to share, nothing to type.
+                //
+                // Every install points at the same public relay by default, so
+                // "share the relay address with them" was instructing the user
+                // to do something that is both unnecessary and impossible —
+                // there is no address to hand out. Two people who install the
+                // app simply appear to each other.
                 EmptyState(
                     title = "Nobody else is here yet",
-                    body = "When another HUSH user connects to this relay, they appear in this list. Share the relay address with them.",
+                    body = "Anyone else who opens HUSH shows up here on its own. " +
+                        "No accounts, no codes, no setup.",
                 )
                 return@Column
             }

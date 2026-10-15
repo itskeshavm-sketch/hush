@@ -41,6 +41,19 @@ sealed interface Screen {
 data class Toast(val text: String, val id: Long = System.nanoTime())
 
 /**
+ * Outcome of a lock-screen PIN entry.
+ *
+ * [Wiped] is deliberately shaped exactly like [Open] to the caller: the lock
+ * screen shows nothing different, because a duress PIN that announces itself
+ * protects no one.
+ */
+sealed interface UnlockResult {
+    data object Open : UnlockResult
+    data object Wiped : UnlockResult
+    data class Refused(val retryInMs: Long) : UnlockResult
+}
+
+/**
  * The single orchestrator.
  *
  * Deliberately one ViewModel rather than one per screen: a chat app's state is
@@ -98,6 +111,173 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
         _themeKey.value = key
     }
 
+    // -------------------------------------------------------------------------
+    // App lock + duress PIN
+    // -------------------------------------------------------------------------
+
+    private val _locked = MutableStateFlow(hasAppPin())
+    val locked: StateFlow<Boolean> = _locked.asStateFlow()
+
+    private val _pinSet = MutableStateFlow(hasAppPin())
+    val pinSet: StateFlow<Boolean> = _pinSet.asStateFlow()
+
+    private val _duressSet = MutableStateFlow(hasDuressPin())
+    val duressSet: StateFlow<Boolean> = _duressSet.asStateFlow()
+
+    private var lastPausedAt = 0L
+
+    fun hasAppPin(): Boolean = prefs.getString(KEY_PIN_HASH, null) != null
+    fun hasDuressPin(): Boolean = prefs.getString(KEY_DURESS_HASH, null) != null
+
+    /** Store a new app PIN. Returns false when the format is wrong. */
+    fun setAppPin(pin: String): Boolean {
+        if (!validPinFormat(pin)) return false
+        prefs.edit().putString(KEY_PIN_HASH, hashPin(pin)).apply()
+        _pinSet.value = true
+        return true
+    }
+
+    /**
+     * Store the duress PIN. Requires an app PIN to already exist, and refuses
+     * a duress PIN equal to it — same salt, same hash means same PIN, and a
+     * duress PIN you cannot distinguish from the real one is the whole point,
+     * but one that IS the real one wipes the owner on a normal unlock.
+     */
+    fun setDuressPin(pin: String): Boolean {
+        val appHash = prefs.getString(KEY_PIN_HASH, null) ?: return false
+        if (!validPinFormat(pin)) return false
+        if (hashPinWithSalt(pin, saltOf(appHash)) == appHash) return false
+        prefs.edit().putString(KEY_DURESS_HASH, hashPin(pin)).apply()
+        _duressSet.value = true
+        return true
+    }
+
+    /** Remove both PINs after verifying the current app PIN. */
+    fun removePins(currentPin: String): Boolean {
+        if (!checkPin(currentPin)) return false
+        prefs.edit().remove(KEY_PIN_HASH).remove(KEY_DURESS_HASH).apply()
+        _pinSet.value = false
+        _duressSet.value = false
+        _locked.value = false
+        return true
+    }
+
+    fun verifyPin(pin: String): Boolean = checkPin(pin)
+
+    fun lockNow() {
+        if (hasAppPin()) _locked.value = true
+    }
+
+    fun onAppBackgrounded() {
+        lastPausedAt = System.currentTimeMillis()
+    }
+
+    fun onAppForegrounded() {
+        if (hasAppPin() && lastPausedAt > 0 &&
+            System.currentTimeMillis() - lastPausedAt > LOCK_TIMEOUT_MS
+        ) {
+            _locked.value = true
+        }
+    }
+
+    /**
+     * Attempt an unlock. The duress hash is checked FIRST: a duress PIN must
+     * open into a wiped install, and checking the app PIN first would change
+     * nothing observable — but order matters for the fail counter, which a
+     * duress entry must never increment.
+     */
+    fun unlock(pin: String): UnlockResult {
+        val now = System.currentTimeMillis()
+        val lockoutUntil = prefs.getLong(KEY_PIN_LOCKOUT_UNTIL, 0L)
+        if (now < lockoutUntil) {
+            return UnlockResult.Refused(lockoutUntil - now)
+        }
+
+        prefs.getString(KEY_DURESS_HASH, null)?.let { duressHash ->
+            if (hashPinWithSalt(pin, saltOf(duressHash)) == duressHash) {
+                wipeAllData()
+                return UnlockResult.Wiped
+            }
+        }
+
+        if (checkPin(pin)) {
+            prefs.edit().remove(KEY_PIN_FAILS).remove(KEY_PIN_LOCKOUT_UNTIL).apply()
+            _locked.value = false
+            if (displayName.isNotEmpty()) startRelay()
+            return UnlockResult.Open
+        }
+
+        val fails = prefs.getInt(KEY_PIN_FAILS, 0) + 1
+        return if (fails >= MAX_PIN_FAILS) {
+            val wait = PIN_LOCKOUT_MS
+            prefs.edit()
+                .putInt(KEY_PIN_FAILS, 0)
+                .putLong(KEY_PIN_LOCKOUT_UNTIL, now + wait)
+                .apply()
+            UnlockResult.Refused(wait)
+        } else {
+            prefs.edit().putInt(KEY_PIN_FAILS, fails).apply()
+            UnlockResult.Refused(0L)
+        }
+    }
+
+    /**
+     * Total erasure: messages, peers, identity, prekeys, pins, theme, relay
+     * pin. The in-memory ratchet sessions are wiped too, so key material does
+     * not survive in the process either. Afterwards the install is
+     * indistinguishable from fresh — onboarding, unlocked, no PIN.
+     */
+    private fun wipeAllData() {
+        viewModelScope.launch {
+            runCatching { store.nuke() }
+            sessions.clearAll()
+            relay.disconnect()
+            prefs.edit().clear().apply()
+            getApplication<Application>().getSharedPreferences("hush_identity", Application.MODE_PRIVATE)
+                .edit().clear().apply()
+            getApplication<Application>().getSharedPreferences("hush_prekeys", Application.MODE_PRIVATE)
+                .edit().clear().apply()
+            _peers.value = emptyList()
+            _messages.value = emptyList()
+            _themeKey.value = dev.hush.chat.ui.theme.HushThemeKeys.DEFAULT
+            _pinSet.value = false
+            _duressSet.value = false
+            _locked.value = false
+            _screen.value = Screen.Onboarding
+        }
+    }
+
+    private fun validPinFormat(pin: String): Boolean =
+        pin.length in MIN_PIN_LEN..MAX_PIN_LEN && pin.all { it.isDigit() }
+
+    private fun checkPin(pin: String): Boolean {
+        val stored = prefs.getString(KEY_PIN_HASH, null) ?: return false
+        return hashPinWithSalt(pin, saltOf(stored)) == stored
+    }
+
+    private fun hashPin(pin: String): String {
+        val salt = ByteArray(PIN_SALT_LEN)
+        java.security.SecureRandom().nextBytes(salt)
+        return combine(salt, sha256(salt + pin.toByteArray()))
+    }
+
+    private fun hashPinWithSalt(pin: String, salt: ByteArray): String =
+        combine(salt, sha256(salt + pin.toByteArray()))
+
+    private fun saltOf(stored: String): ByteArray = try {
+        val saltB64 = stored.substringBefore(':')
+        java.util.Base64.getDecoder().decode(saltB64)
+    } catch (e: Exception) {
+        ByteArray(0)
+    }
+
+    private fun combine(salt: ByteArray, hash: ByteArray): String =
+        java.util.Base64.getEncoder().encodeToString(salt) + ":" +
+            java.util.Base64.getEncoder().encodeToString(hash)
+
+    private fun sha256(input: ByteArray): ByteArray =
+        java.security.MessageDigest.getInstance("SHA-256").digest(input)
+
     private var joinLoop: Job? = null
     private var typingResetJob: Job? = null
     private var typingSentAt = 0L
@@ -106,7 +286,9 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
         sessions.loadOrCreateIdentity()
         if (displayName.isNotEmpty()) {
             _screen.value = Screen.Roster
-            startRelay()
+            // A locked install does not connect until the PIN opens it: no
+            // roster, no presence, no inbound frames while gated.
+            if (!hasAppPin()) startRelay()
         }
     }
 
@@ -561,6 +743,17 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
         private const val KEY_RELAY_PIN = "relay_pin"
         private const val KEY_JOINED_AT = "joined_at"
         private const val KEY_APP_THEME = "app_theme"
+        private const val KEY_PIN_HASH = "pin_hash"
+        private const val KEY_DURESS_HASH = "duress_hash"
+        private const val KEY_PIN_FAILS = "pin_fails"
+        private const val KEY_PIN_LOCKOUT_UNTIL = "pin_lockout_until"
+
+        private const val MIN_PIN_LEN = 4
+        private const val MAX_PIN_LEN = 12
+        private const val PIN_SALT_LEN = 16
+        private const val MAX_PIN_FAILS = 5
+        private const val PIN_LOCKOUT_MS = 30_000L
+        private const val LOCK_TIMEOUT_MS = 60_000L
 
         private const val TYPING_TIMEOUT_MS = 4_000L
         private const val TYPING_THROTTLE_MS = 1_500L

@@ -528,6 +528,20 @@ class SessionManager(private val context: Context) {
         sessions.remove(peerId)?.wipe()
     }
 
+    /**
+     * Scrub everything: every session's key material, the identity, the local
+     * peer id. Used by the duress wipe — key material must not survive in the
+     * process after the database is gone.
+     */
+    fun clearAll() {
+        sessions.values.forEach { runCatching { it.wipe() } }
+        sessions.clear()
+        locks.clear()
+        identity = null
+        localPeerId = null
+        _identityReady.value = false
+    }
+
     companion object {
         private const val TAG = "HushSessions"
         private const val KEY_IDENTITY_PRIVATE = "identity_private"

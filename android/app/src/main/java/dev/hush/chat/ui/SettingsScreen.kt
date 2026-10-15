@@ -75,14 +75,24 @@ import dev.hush.chat.ui.theme.HushWarning
 fun SettingsScreen(
     displayName: String,
     themeKey: String,
+    pinSet: Boolean,
+    duressSet: Boolean,
     relayFingerprint: String?,
     onDisplayNameChange: (String) -> Unit,
     onThemeChange: (String) -> Unit,
+    onSetAppPin: (String) -> Boolean,
+    onSetDuressPin: (String) -> Boolean,
+    onVerifyPin: (String) -> Boolean,
+    onRemoveLock: (String) -> Boolean,
+    onLockNow: () -> Unit,
     onTrustNewCertificate: (String) -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var name by remember(displayName) { mutableStateOf(displayName) }
+    var pinStep by remember(pinSet) { mutableStateOf(PinStep.NONE) }
+    var pinFirst by remember { mutableStateOf("") }
+    var pinError by remember { mutableStateOf<String?>(null) }
 
     Scaffold(
         modifier = modifier,
@@ -126,6 +136,16 @@ fun SettingsScreen(
             ThemePicker(
                 selectedKey = themeKey,
                 onSelect = onThemeChange,
+            )
+
+            Spacer(Modifier.height(14.dp))
+
+            SectionHeader("Privacy")
+            PrivacyRows(
+                pinSet = pinSet,
+                duressSet = duressSet,
+                onAction = { pinStep = it; pinFirst = ""; pinError = null },
+                onLockNow = onLockNow,
             )
 
             Spacer(Modifier.height(14.dp))
@@ -217,6 +237,220 @@ fun SettingsScreen(
             Spacer(Modifier.height(40.dp))
         }
     }
+
+    if (pinStep != PinStep.NONE) {
+        PinStepDialog(
+            step = pinStep,
+            onConfirm = { pin ->
+                when (pinStep) {
+                    PinStep.NEW_APP -> {
+                        if (!validPin(pin)) {
+                            pinError = "Use 4 to 12 digits."
+                        } else {
+                            pinFirst = pin
+                            pinStep = PinStep.CONFIRM_APP
+                            pinError = null
+                        }
+                    }
+                    PinStep.CONFIRM_APP -> {
+                        if (pin != pinFirst) {
+                            pinError = "Those don't match. Start over."
+                            pinStep = PinStep.NEW_APP
+                        } else if (onSetAppPin(pin)) {
+                            pinStep = PinStep.NONE
+                        } else {
+                            pinError = "That PIN won't work. Try another."
+                        }
+                    }
+                    PinStep.VERIFY -> {
+                        if (onVerifyPin(pin)) {
+                            pinStep = PinStep.NEW_APP
+                            pinError = null
+                        } else {
+                            pinError = "Wrong PIN."
+                        }
+                    }
+                    PinStep.NEW_DURESS -> {
+                        if (!validPin(pin)) {
+                            pinError = "Use 4 to 12 digits."
+                        } else {
+                            pinFirst = pin
+                            pinStep = PinStep.CONFIRM_DURESS
+                            pinError = null
+                        }
+                    }
+                    PinStep.CONFIRM_DURESS -> {
+                        if (pin != pinFirst) {
+                            pinError = "Those don't match. Start over."
+                            pinStep = PinStep.NEW_DURESS
+                        } else if (onSetDuressPin(pin)) {
+                            pinStep = PinStep.NONE
+                        } else {
+                            pinError = "Must differ from the app PIN."
+                            pinStep = PinStep.NEW_DURESS
+                        }
+                    }
+                    PinStep.VERIFY_REMOVE -> {
+                        if (onRemoveLock(pin)) {
+                            pinStep = PinStep.NONE
+                        } else {
+                            pinError = "Wrong PIN."
+                        }
+                    }
+                    PinStep.NONE -> Unit
+                }
+            },
+            error = pinError,
+            onDismiss = { pinStep = PinStep.NONE; pinError = null },
+        )
+    }
+}
+
+private enum class PinStep {
+    NONE, NEW_APP, CONFIRM_APP, VERIFY, NEW_DURESS, CONFIRM_DURESS, VERIFY_REMOVE,
+}
+
+private fun validPin(pin: String): Boolean =
+    pin.length in 4..12 && pin.all { it.isDigit() }
+
+/**
+ * The lock rows. When no PIN exists there is one row; once set, the section
+ * grows change / duress / remove / lock-now rows. The duress row names the
+ * consequence outright — a wipe PIN whose effect is a surprise is a Deleted
+ * Data mystery, not a feature.
+ */
+@Composable
+private fun PrivacyRows(
+    pinSet: Boolean,
+    duressSet: Boolean,
+    onAction: (PinStep) -> Unit,
+    onLockNow: () -> Unit,
+) {
+    Column(
+        modifier = Modifier.padding(horizontal = 20.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        if (!pinSet) {
+            PrivacyRow(
+                title = "Set app PIN",
+                body = "Asked every time the app opens. Separate from the phone lock.",
+                onClick = { onAction(PinStep.NEW_APP) },
+            )
+        } else {
+            PrivacyRow(
+                title = "Change app PIN",
+                body = "Needs the current PIN first.",
+                onClick = { onAction(PinStep.VERIFY) },
+            )
+            PrivacyRow(
+                title = if (duressSet) "Change erase-data PIN" else "Set erase-data PIN",
+                body = if (duressSet) {
+                    "Entering it on the lock screen still erases everything."
+                } else {
+                    "A second PIN that erases everything when entered on the lock screen."
+                },
+                onClick = { onAction(PinStep.NEW_DURESS) },
+            )
+            PrivacyRow(title = "Lock now", body = null, onClick = onLockNow)
+            PrivacyRow(
+                title = "Remove lock",
+                body = "Needs the current PIN.",
+                onClick = { onAction(PinStep.VERIFY_REMOVE) },
+                danger = true,
+            )
+        }
+    }
+}
+
+@Composable
+private fun PrivacyRow(
+    title: String,
+    body: String?,
+    onClick: () -> Unit,
+    danger: Boolean = false,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .background(HushSurfaceElevated.copy(alpha = 0.4f))
+            .clickable(onClick = onClick)
+            .padding(14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.titleMedium,
+                color = if (danger) HushDanger else MaterialTheme.colorScheme.onBackground,
+            )
+            body?.let {
+                Text(
+                    text = it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = HushTextTertiary,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun PinStepDialog(
+    step: PinStep,
+    onConfirm: (String) -> Unit,
+    error: String?,
+    onDismiss: () -> Unit,
+) {
+    var pin by remember(step) { mutableStateOf("") }
+    val (title, confirm) = when (step) {
+        PinStep.NEW_APP -> "Choose an app PIN" to "Continue"
+        PinStep.CONFIRM_APP -> "Repeat the PIN" to "Save PIN"
+        PinStep.VERIFY -> "Enter the current PIN" to "Continue"
+        PinStep.NEW_DURESS -> "Choose an erase-data PIN" to "Continue"
+        PinStep.CONFIRM_DURESS -> "Repeat the erase-data PIN" to "Save"
+        PinStep.VERIFY_REMOVE -> "Enter the current PIN" to "Remove lock"
+        PinStep.NONE -> "" to ""
+    }
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (step == PinStep.NEW_DURESS) {
+                    Text(
+                        text = "Entering this PIN on the lock screen erases chats, identity, and settings.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = HushTextSecondary,
+                    )
+                }
+                OutlinedTextField(
+                    value = pin,
+                    onValueChange = { pin = it.filter(Char::isDigit).take(12) },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                    visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = HushAccent,
+                        unfocusedBorderColor = HushSurfaceElevated,
+                    ),
+                )
+                error?.let {
+                    Text(text = it, style = MaterialTheme.typography.bodySmall, color = HushDanger)
+                }
+            }
+        },
+        confirmButton = {
+            androidx.compose.material3.TextButton(onClick = { onConfirm(pin) }) {
+                Text(confirm)
+            }
+        },
+        dismissButton = {
+            androidx.compose.material3.TextButton(onClick = onDismiss) {
+                Text("Cancel")
+            }
+        },
+    )
 }
 
 /**

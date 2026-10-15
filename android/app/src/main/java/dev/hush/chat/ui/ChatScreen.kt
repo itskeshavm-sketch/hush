@@ -73,8 +73,10 @@ import dev.hush.chat.data.Message
 import dev.hush.chat.ui.components.InitialsAvatar
 import dev.hush.chat.ui.components.TypingIndicator
 import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import dev.hush.chat.ui.theme.HushAccent
@@ -339,18 +341,24 @@ private fun MessageRow(
                             border = if (outgoing) null else BorderStroke(1.dp, HushBubbleEdge.copy(alpha = 0.6f)),
                         ) {
                             Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+                                // Body colour follows the bubble, not the page. The old code
+                                // used onBackground everywhere, which is dark ink on the
+                                // light theme — invisible on the blue outgoing bubble.
+                                // Outgoing bubbles are dark on every theme, so white
+                                // always wins there; incoming bubbles sit on the
+                                // page, so page text wins there.
                                 Text(
                                     text = message.body,
                                     style = MaterialTheme.typography.bodyLarge,
                                     lineHeight = 22.sp,
-                                    color = MaterialTheme.colorScheme.onBackground,
+                                    color = if (outgoing) Color.White else MaterialTheme.colorScheme.onBackground,
                                 )
                                 Spacer(Modifier.height(3.dp))
                                 Row(verticalAlignment = Alignment.CenterVertically) {
                                     Text(
                                         text = clockFormat(message.sentAt),
                                         style = MaterialTheme.typography.labelSmall,
-                                        color = if (outgoing) HushTextSecondary else HushTextTertiary,
+                                        color = if (outgoing) Color.White.copy(alpha = 0.72f) else HushTextTertiary,
                                     )
                                     if (outgoing) {
                                         Spacer(Modifier.width(6.dp))
@@ -393,27 +401,26 @@ private fun MessageRow(
 @Composable
 private fun DeliveryMark(state: DeliveryState, onRetry: () -> Unit) {
     when (state) {
-        // Double-check reads as delivered; a single check reads as sent. Text
-        // labels ("· sent") read as debug output, which is what the old UI
-        // showed and what the screenshot caught.
+        // Marks always sit on an outgoing bubble, so they are white — never
+        // the accent, which is unreadable on the light theme's blue bubble.
         DeliveryState.SENT -> Text(
             text = "✓✓",
             style = MaterialTheme.typography.labelSmall,
             fontWeight = FontWeight.SemiBold,
-            color = HushAccent,
+            color = Color.White.copy(alpha = 0.9f),
             letterSpacing = 0.sp,
         )
         DeliveryState.PENDING -> Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
                 text = "✓",
                 style = MaterialTheme.typography.labelSmall,
-                color = HushTextTertiary,
+                color = Color.White.copy(alpha = 0.7f),
             )
             Spacer(Modifier.width(3.dp))
             Text(
                 text = "sending",
                 style = MaterialTheme.typography.labelSmall,
-                color = HushTextTertiary,
+                color = Color.White.copy(alpha = 0.7f),
             )
         }
         DeliveryState.FAILED -> Row(
@@ -498,9 +505,20 @@ private fun Composer(
         Spacer(Modifier.width(10.dp))
 
         val canSend = draft.isNotBlank()
+        // The button breathes with the draft: a spring pop on enable reads as
+        // alive; a static colour flip reads as a redraw.
+        val sendScale by animateFloatAsState(
+            targetValue = if (canSend) 1f else 0.92f,
+            animationSpec = spring(
+                dampingRatio = Spring.DampingRatioMediumBouncy,
+                stiffness = Spring.StiffnessMedium,
+            ),
+            label = "sendScale",
+        )
         Box(
             modifier = Modifier
                 .size(48.dp)
+                .scale(sendScale)
                 .shadow(
                     elevation = if (canSend) 10.dp else 0.dp,
                     shape = CircleShape,

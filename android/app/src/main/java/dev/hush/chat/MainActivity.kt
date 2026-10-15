@@ -5,13 +5,24 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.hush.chat.ui.ChatScreen
@@ -19,6 +30,7 @@ import dev.hush.chat.ui.OnboardingScreen
 import dev.hush.chat.ui.RosterScreen
 import dev.hush.chat.ui.SafetyNumberScreen
 import dev.hush.chat.ui.SearchScreen
+import dev.hush.chat.ui.LockScreen
 import dev.hush.chat.ui.SettingsScreen
 import dev.hush.chat.ui.theme.HushTheme
 
@@ -51,6 +63,22 @@ private fun HushRoot(viewModel: HushViewModel = viewModel()) {
 
     val themeKey by viewModel.themeKey.collectAsStateWithLifecycle()
 
+    // Relock when the app has been backgrounded past the timeout. ON_PAUSE
+    // fires for the recents screen too, which is exactly the surface a lock
+    // exists for.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, viewModel) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_PAUSE -> viewModel.onAppBackgrounded()
+                Lifecycle.Event.ON_RESUME -> viewModel.onAppForegrounded()
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
     val snackbar = remember { SnackbarHostState() }
 
     LaunchedEffect(toast) {
@@ -60,11 +88,35 @@ private fun HushRoot(viewModel: HushViewModel = viewModel()) {
         }
     }
 
+    val locked by viewModel.locked.collectAsStateWithLifecycle()
+    val pinSet by viewModel.pinSet.collectAsStateWithLifecycle()
+    val duressSet by viewModel.duressSet.collectAsStateWithLifecycle()
+
     HushTheme(themeKey = themeKey) {
+    // A locked phone shows nothing else — not the roster, not a preview.
+    // The overlay sits above the scaffold so no screen underneath can leak.
+    if (locked) {
+        LockScreen(onUnlock = viewModel::unlock)
+    } else {
     androidx.compose.material3.Scaffold(
         snackbarHost = { SnackbarHost(snackbar) },
     ) { _ ->
-        when (val s = screen) {
+        // Screens cross-fade with a short lateral drift. Fast enough to feel
+        // instant, present enough to feel spatial: back goes right, forward
+        // goes left. AnimatedContent keys on the Screen value, so a peer
+        // switch inside Chat re-runs it — which is correct, it is a
+        // different place.
+        AnimatedContent(
+            targetState = screen,
+            label = "screen",
+            transitionSpec = {
+                (fadeIn(animationSpec = tween(180)) +
+                    slideInHorizontally(animationSpec = tween(180)) { it / 6 }) togetherWith
+                    (fadeOut(animationSpec = tween(140)) +
+                        slideOutHorizontally(animationSpec = tween(140)) { -it / 6 })
+            },
+        ) { target ->
+        when (val s = target) {
             is Screen.Onboarding -> OnboardingScreen(
                 initialRelay = viewModel.relayUrl,
                 onContinue = { name, relay -> viewModel.completeOnboarding(name, relay) },
@@ -115,9 +167,16 @@ private fun HushRoot(viewModel: HushViewModel = viewModel()) {
             is Screen.Settings -> SettingsScreen(
                 displayName = viewModel.displayName,
                 themeKey = themeKey,
+                pinSet = pinSet,
+                duressSet = duressSet,
                 relayFingerprint = fingerprint,
                 onDisplayNameChange = viewModel::changeDisplayName,
                 onThemeChange = viewModel::setTheme,
+                onSetAppPin = viewModel::setAppPin,
+                onSetDuressPin = viewModel::setDuressPin,
+                onVerifyPin = viewModel::verifyPin,
+                onRemoveLock = viewModel::removePins,
+                onLockNow = viewModel::lockNow,
                 onTrustNewCertificate = viewModel::trustNewRelayCertificate,
                 onBack = { viewModel.navigate(Screen.Roster) },
             )
@@ -135,6 +194,8 @@ private fun HushRoot(viewModel: HushViewModel = viewModel()) {
                 viewModel.navigate(Screen.Roster)
             }
         }
+        }
+    }
     }
     }
 }

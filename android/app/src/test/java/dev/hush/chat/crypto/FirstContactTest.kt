@@ -263,4 +263,68 @@ class FirstContactTest {
         assertNotNull("same aad on both sides must decrypt", plaintext)
         assertTrue(String(plaintext!!) == secret)
     }
+
+    @Test
+    fun `responding with our own identity instead of theirs does not agree`() {
+        val alice = Peer("alice")
+        val bob = Peer("bob")
+
+        val bobBundle = PrekeyBundle.fromBase64Json(bob.publishedJson())!!
+        val initiator = X3dh.initiate(alice.identity, bobBundle)
+
+        // The old SessionManager.decrypt passed `identity.identityPublic` —
+        // the RESPONDER's own key — as remoteIdentityPublic. DH1 then becomes
+        // DH(SPK_B, IK_B) instead of DH(SPK_B, IK_A): valid math, wrong value,
+        // different root key, tag never verifies.
+        val wrong = X3dh.respond(
+            identityKey = bob.identity,
+            signedPrekey = SignedPrekey(
+                bob.signed.privateKey, bob.signed.publicKey, bob.counter, bob.signature,
+            ),
+            remoteIdentityPublic = bob.identity.publicKey,
+            remoteEphemeralPublic = initiator.initialRatchet!!.publicKey,
+        )
+
+        assertFalse(
+            "responding with your own identity must NOT reproduce the sender's root key; " +
+                "if this ever passes, the regression test has lost its teeth",
+            digest(initiator.rootKey, ByteArray(0))
+                .contentEquals(digest(wrong.rootKey, ByteArray(0))),
+        )
+    }
+
+    @Test
+    fun `a full reply round trips both directions on one session pair`() {
+        val alice = Peer("alice")
+        val bob = Peer("bob")
+        val aad = "HUSH/msg/v1".toByteArray()
+
+        // A -> B, first contact.
+        val bobBundle = PrekeyBundle.fromBase64Json(bob.publishedJson())!!
+        val initiator = X3dh.initiate(alice.identity, bobBundle)
+        val aliceSession = DoubleRatchet.create(initiator, aad)
+        val first = aliceSession.encrypt("hey bob".toByteArray())
+        val firstDh = first.copyOfRange(0, DoubleRatchet.DH_KEY_LEN)
+
+        val responder = X3dh.respond(
+            identityKey = bob.identity,
+            signedPrekey = SignedPrekey(
+                bob.signed.privateKey, bob.signed.publicKey, bob.counter, bob.signature,
+            ),
+            remoteIdentityPublic = alice.identity.publicKey,
+            remoteEphemeralPublic = firstDh,
+        )
+        val bobSession = DoubleRatchet.create(responder, aad)
+        bobSession.adoptPeerRatchetKey(firstDh)
+        assertTrue(String(bobSession.decrypt(first)!!) == "hey bob")
+
+        // B -> A, reply on the same sessions. This exercises the DH ratchet
+        // in the other direction; if the first contact derived mismatched
+        // roots, the reply fails too, but if only the reply path is broken
+        // the one-directional tests above would still pass.
+        val reply = bobSession.encrypt("hey alice".toByteArray())
+        val back = aliceSession.decrypt(reply)
+        assertNotNull("the reply must decrypt on the initiator's session", back)
+        assertTrue(String(back!!) == "hey alice")
+    }
 }

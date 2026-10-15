@@ -368,6 +368,18 @@ class SessionManager(private val context: Context) {
             // message permanently undecryptable; the caller did exactly that.
             val local = localBundle()
             val initial = try {
+                // remoteIdentityPublic MUST be the sender's identity key, from
+                // their verified bundle — not our own.
+                //
+                // This previously passed `identity.identityPublic` (our own key).
+                // Responder DH1 is DH(SPK_ours, remoteIdentity), initiator DH1
+                // is DH(IK_theirs, SPK_ours_pub). Those agree only when
+                // remoteIdentity is THEIR identity: DH(SPK_B, IK_A) equals
+                // DH(IK_A, SPK_B) by symmetry, while DH(SPK_B, IK_B) — what
+                // the old code computed — is a different value entirely. Same
+                // shape of failure as the wiped prekeys and the directional
+                // aad: correct keys on both sides, different root keys, tag
+                // never verifies, toast on every message.
                 X3dh.respond(
                     identity.identityKey,
                     SignedPrekey(
@@ -376,7 +388,7 @@ class SessionManager(private val context: Context) {
                         counter = local.counter,
                         signature = local.signature,
                     ),
-                    identity.identityPublic,
+                    bundle.identity,
                     headerDh,
                 )
             } catch (e: Exception) {

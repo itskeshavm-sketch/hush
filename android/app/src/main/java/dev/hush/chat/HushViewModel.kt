@@ -287,9 +287,24 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * The peer's currently published prekey bundle.
+     *
+     * Read from the live roster rather than the local peer table, because the
+     * roster is what the relay is handing out at this instant and a bundle
+     * cached at join time may since have been republished.
+     *
+     * This used to be written as
+     *
+     *     store.loadPeers().firstOrNull { it.id == peerId }?.let { null } ?: relay…
+     *
+     * which looks like "try the database, then fall back to the roster". It is
+     * not: `?.let { null }` evaluates to null whether or not the peer is found,
+     * so the elvis always fell through and the first operand never contributed
+     * anything. It read like a fallback chain and silently was not one.
+     */
     private suspend fun prekeyFor(peerId: String): String? =
-        store.loadPeers().firstOrNull { it.id == peerId }?.let { null } ?: relay.roster.value
-            .firstOrNull { it.id == peerId }?.prekeyJson
+        relay.roster.value.firstOrNull { it.id == peerId }?.prekeyJson
 
     fun retryMessage(peerId: String, messageId: String) {
         val message = _messages.value.firstOrNull { it.id == messageId } ?: return

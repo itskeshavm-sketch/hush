@@ -7,8 +7,11 @@ import dev.hush.chat.crypto.Identity
 import dev.hush.chat.crypto.KeyPair
 import dev.hush.chat.crypto.Primitives
 import dev.hush.chat.crypto.PrekeyBundle
+import dev.hush.chat.crypto.SignedPrekey
+import dev.hush.chat.crypto.SignedPrekeyPublic
 import dev.hush.chat.crypto.X3dh
 import dev.hush.chat.crypto.b64
+import dev.hush.chat.crypto.prekeySignatureMessage
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -107,14 +110,7 @@ class SessionManager(private val context: Context) {
     /** Build the `hello` frame announcing this device to the relay. */
     fun buildHello(displayName: String, joinedAt: Long): JSONObject {
         val id = requireNotNull(identity) { "identity not loaded" }
-        val counter = (System.currentTimeMillis() / 86_400_000L).toInt()
-
-        val prekey = KeyPair.generate()
-        val signedKey = KeyPair.generate()
-        val signature = Primitives.ed25519Sign(
-            dev.hush.chat.crypto.prekeySignatureMessage(id.identityPublic, prekey.publicKey, counter),
-            id.signingKey,
-        )
+        val local = localBundle()
 
         val bundle = PrekeyBundle(
             identity = id.identityPublic,
@@ -123,13 +119,21 @@ class SessionManager(private val context: Context) {
             // roughly half of all peers, because the two key types are not
             // interchangeable even though both are 32 bytes.
             signingKey = id.signingPublic,
-            prekey = prekey.publicKey,
-            signed = dev.hush.chat.crypto.SignedPrekeyPublic(signedKey.publicKey, signature, counter),
+            prekey = local.prekeyPublic,
+            signed = SignedPrekeyPublic(local.signedPublic, local.signature, local.counter),
         )
 
-        prekey.wipe()
-        signedKey.wipe()
-
+        // The private halves are deliberately NOT wiped here.
+        //
+        // They used to be, which is why first contact never worked. The
+        // published bundle is a public API: once a peer has it, every message
+        // sealed against it must stay decryptable by *this* device, for as long
+        // as the relay keeps handing that bundle out. Wiping the private halves
+        // at the end of this function made the device publish a key and
+        // immediately destroy the ability to answer for it, so the responder
+        // fell back to an invented key and derived a different root key than
+        // the sender — "Could not decrypt a message from X", every time, for
+        // every peer, with no error anywhere except the AEAD tag failing.
         return JSONObject()
             .put("t", "hello")
             .put("name", displayName)
@@ -145,6 +149,85 @@ class SessionManager(private val context: Context) {
             .put("prekey", org.json.JSONObject(bundle.toBase64Json()))
             .put("joined", joinedAt > 0)
     }
+
+    /**
+     * This device's own prekey bundle, private halves included.
+     *
+     * Generated once and reused for the lifetime of the install. Two properties
+     * matter and both were violated before:
+     *
+     *  1. The signed prekey's private half must survive. It is the responder's
+     *     half of X3DH: the initiator derives `DH2 = DH(EK, SPK_public)`, so
+     *     only the holder of the matching private half can reproduce it.
+     *
+     *  2. The published bundle must be *stable across reconnects*. Peers cache
+     *     the bundle from the roster; if every `hello` published fresh keys,
+     *     a message sealed against yesterday's copy could never be opened, and
+     *     the failure would look identical to a random one.
+     *
+     * Prekey rotation is a documented simplification — see the README. One
+     * stable bundle is the honest version of that, not an oversight.
+     */
+    private fun localBundle(): LocalBundle {
+        val id = requireNotNull(identity) { "identity not loaded" }
+        val prefs = context.getSharedPreferences(PREFS_PREKEYS, Context.MODE_PRIVATE)
+
+        val decode = { raw: String? ->
+            raw?.let { runCatching { java.util.Base64.getDecoder().decode(it) }.getOrNull() }
+        }
+
+        val prekeyPrivate = decode(prefs.getString(KEY_LOCAL_PREKEY, null))
+        val signedPrivate = decode(prefs.getString(KEY_LOCAL_SIGNED, null))
+
+        if (prekeyPrivate?.size == 32 && signedPrivate?.size == 32) {
+            val counter = prefs.getInt(KEY_LOCAL_COUNTER, 0)
+            val prekeyPublic = Primitives.x25519Public(prekeyPrivate)
+            val signedPublic = Primitives.x25519Public(signedPrivate)
+            // Recomputed rather than stored: the signing key is already
+            // persisted, and a bundle whose signature does not match its own
+            // fields is rejected by every peer.
+            val signature = Primitives.ed25519Sign(
+                prekeySignatureMessage(id.identityPublic, prekeyPublic, counter),
+                id.signingKey,
+            )
+            return LocalBundle(
+                prekeyPrivate, prekeyPublic, signedPrivate, signedPublic, signature, counter,
+            )
+        }
+
+        val prekey = KeyPair.generate()
+        val signed = KeyPair.generate()
+        val counter = (System.currentTimeMillis() / 86_400_000L).toInt()
+        val signature = Primitives.ed25519Sign(
+            prekeySignatureMessage(id.identityPublic, prekey.publicKey, counter),
+            id.signingKey,
+        )
+
+        prefs.edit()
+            .putString(KEY_LOCAL_PREKEY, java.util.Base64.getEncoder().encodeToString(prekey.privateKey))
+            .putString(KEY_LOCAL_SIGNED, java.util.Base64.getEncoder().encodeToString(signed.privateKey))
+            .putInt(KEY_LOCAL_COUNTER, counter)
+            .apply()
+
+        return LocalBundle(
+            prekeyPrivate = prekey.privateKey.copyOf(),
+            prekeyPublic = prekey.publicKey.copyOf(),
+            signedPrivate = signed.privateKey.copyOf(),
+            signedPublic = signed.publicKey.copyOf(),
+            signature = signature,
+            counter = counter,
+        )
+    }
+
+    /** The private halves behind the bundle this device publishes. */
+    private data class LocalBundle(
+        val prekeyPrivate: ByteArray,
+        val prekeyPublic: ByteArray,
+        val signedPrivate: ByteArray,
+        val signedPublic: ByteArray,
+        val signature: ByteArray,
+        val counter: Int,
+    )
 
     fun noteLocalPeerId(id: String) {
         localPeerId = id
@@ -227,7 +310,29 @@ class SessionManager(private val context: Context) {
             // Only the DH *field* — 32 bytes — is the X3DH ephemeral. The rest
             // of the header is chain counters, not key material.
             val headerDh = payload.copyOfRange(0, DoubleRatchet.DH_KEY_LEN.coerceAtMost(payload.size))
-            val initial = X3dh.respond(identity.identityKey, responderPrekey(peerId), identity.identityPublic, headerDh)
+
+            // The signed prekey handed to `respond` MUST be the one this device
+            // published in its bundle — private half included.
+            //
+            // This previously generated a fresh random key per conversation and
+            // persisted that instead. The initiator had sealed against the
+            // *published* signed prekey, so the two sides derived different
+            // root keys and every first message failed to authenticate with
+            // "Could not decrypt a message from X". `X3dh.respond` carries a
+            // comment warning that generating a fresh key here makes the first
+            // message permanently undecryptable; the caller did exactly that.
+            val local = localBundle()
+            val initial = X3dh.respond(
+                identity.identityKey,
+                SignedPrekey(
+                    privateKey = local.signedPrivate.copyOf(),
+                    publicKey = local.signedPublic,
+                    counter = local.counter,
+                    signature = local.signature,
+                ),
+                identity.identityPublic,
+                headerDh,
+            )
             val session = DoubleRatchet.create(initial, aadFor(peerId))
             session.adoptPeerRatchetKey(headerDh)
             sessions[peerId] = session
@@ -247,25 +352,6 @@ class SessionManager(private val context: Context) {
         } else {
             InboundResult.Text(peerId, peerId, "", plaintext, System.currentTimeMillis())
         }
-
-    /**
-     * The responder's signed prekey private half.
-     *
-     * HUSH keeps a small pool of these in preferences. A real deployment rotates
-     * them; this implementation holds one per session, which is enough to
-     * demonstrate the handshake and is called out as a simplification in the
-     * README rather than hidden.
-     */
-    private fun responderPrekey(peerId: String) = runBlockingGet {
-        val prefs = context.getSharedPreferences("hush_prekeys", Context.MODE_PRIVATE)
-        val existing = prefs.getString(KEY_PREKEY_PREFIX + peerId, null)
-            ?.let { runCatching { java.util.Base64.getDecoder().decode(it) }.getOrNull() }
-
-        val priv = existing ?: Primitives.randomBytes(32).also {
-            prefs.edit().putString(KEY_PREKEY_PREFIX + peerId, java.util.Base64.getEncoder().encodeToString(it)).apply()
-        }
-        dev.hush.chat.crypto.SignedPrekey(priv, Primitives.x25519Public(priv), 0, ByteArray(64))
-    }
 
     // -------------------------------------------------------------------------
     // Safety numbers
@@ -313,9 +399,10 @@ class SessionManager(private val context: Context) {
         private const val TAG = "HushSessions"
         private const val KEY_IDENTITY_PRIVATE = "identity_private"
         private const val KEY_SIGNING_PRIVATE = "signing_private"
-        private const val KEY_PREKEY_PREFIX = "prekey_"
+
+        private const val PREFS_PREKEYS = "hush_prekeys"
+        private const val KEY_LOCAL_PREKEY = "local_prekey_private"
+        private const val KEY_LOCAL_SIGNED = "local_signed_prekey_private"
+        private const val KEY_LOCAL_COUNTER = "local_prekey_counter"
     }
 }
-
-/** Run a block on a private lock, without pulling in a coroutine for a cache read. */
-private inline fun <T> runBlockingGet(block: () -> T): T = block()

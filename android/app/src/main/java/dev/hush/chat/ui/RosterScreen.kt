@@ -54,6 +54,7 @@ import dev.hush.chat.ui.components.EmptyState
 import dev.hush.chat.ui.components.InitialsAvatar
 import dev.hush.chat.ui.components.SectionHeader
 import dev.hush.chat.ui.theme.HushAccent
+import dev.hush.chat.ui.theme.HushSurfaceElevated
 import dev.hush.chat.ui.theme.HushDanger
 import dev.hush.chat.ui.theme.HushTextSecondary
 import dev.hush.chat.ui.theme.HushTextTertiary

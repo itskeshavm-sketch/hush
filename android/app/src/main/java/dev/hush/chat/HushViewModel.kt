@@ -320,6 +320,9 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
 
     init {
         sessions.loadOrCreateIdentity()
+        // Groups are local rows: show them immediately, don't wait for the
+        // first roster broadcast.
+        viewModelScope.launch { runCatching { refreshGroups() } }
         if (displayName.isNotEmpty()) {
             _screen.value = Screen.Roster
             // A locked install does not connect until the PIN opens it: no
@@ -1144,14 +1147,17 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
         val members = org.json.JSONArray()
         info.memberIds.forEach { members.put(it) }
         val sealed = sealFor(memberId) {
-            sessions.sealGroupControl(
-                "invite", groupId,
-                mapOf(
-                    "name" to info.name, "admin" to info.adminId,
-                    "created" to info.createdAt, "members" to members,
-                    "history" to historyJson,
-                ),
+            // History rides only if the whole frame stays comfortably under
+            // the relay's envelope cap: a join that never arrives is worse
+            // than a join without context.
+            val fields = mutableMapOf<String, Any?>(
+                "name" to info.name, "admin" to info.adminId,
+                "created" to info.createdAt, "members" to members,
             )
+            if (withHistory && historyJson.toString().length <= MAX_INVITE_HISTORY_BYTES) {
+                fields["history"] = historyJson
+            }
+            sessions.sealGroupControl("invite", groupId, fields)
         } ?: run {
             store.addGroupPending(INVITE_PENDING_PREFIX + groupId, memberId)
             return
@@ -2052,6 +2058,15 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
 
         /** group_pending sentinel prefix marking an unacknowledged invite. */
         private const val INVITE_PENDING_PREFIX = "invite:"
+
+        /**
+         * History budget inside an invite frame: 32 KiB of JSON stays well
+         * under the relay envelope cap after ratchet overhead + base64.
+         * Oversized histories are dropped (join without context), never split
+         * — a half-history with original ids would still delete correctly,
+         * but a missing middle reads as lost messages.
+         */
+        private const val MAX_INVITE_HISTORY_BYTES = 32 * 1024
 
         /**
          * The public relay every install connects to by default.

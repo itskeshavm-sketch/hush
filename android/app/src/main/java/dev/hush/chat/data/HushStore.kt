@@ -257,6 +257,18 @@ class HushStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
         }
     }
 
+    /**
+     * Remove one peer row unconditionally. Only used for our own id: a roster
+     * processed while the local peer id was still unknown plants us as a
+     * peer, and reconcile never removes rows — so the ghost lingers as a
+     * conversation with ourselves. Self rows are never legitimate.
+     */
+    suspend fun deletePeer(peerId: String) = withContext(Dispatchers.IO) {
+        ioLock.write {
+            writableDatabase.execSQL("DELETE FROM peers WHERE id = ?", arrayOf<Any>(peerId))
+        }
+    }
+
     suspend fun loadPeers(): List<Peer> = withContext(Dispatchers.IO) {
         ioLock.read {
             readableDatabase.rawQuery(

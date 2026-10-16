@@ -292,6 +292,12 @@ fun ChatScreen(
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background),
             )
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(1.dp)
+                    .background(HushSurfaceElevated),
+            )
         },
     ) { padding ->
         Column(
@@ -974,10 +980,13 @@ private fun Composer(
     onSend: () -> Unit,
     onAttach: () -> Unit = {},
 ) {
+    Column(modifier = Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface)) {
+        Box(
+            modifier = Modifier.fillMaxWidth().height(1.dp).background(HushSurfaceElevated),
+        )
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .background(MaterialTheme.colorScheme.surface)
             .navigationBarsPadding()
             .padding(horizontal = 12.dp, vertical = 10.dp),
         verticalAlignment = Alignment.Bottom,
@@ -1046,6 +1055,7 @@ private fun Composer(
                 modifier = Modifier.size(20.dp),
             )
         }
+    }
     }
 }
 

@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">HUSH</string>
+    <string name="app_name">HUSH Modern</string>
 
     <string name="channel_call">Active call</string>
     <string name="channel_call_description">Shows while a HUSH call is in progress</string>

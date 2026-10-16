@@ -47,8 +47,8 @@ android {
 
     buildTypes {
         debug {
-            applicationIdSuffix = ".debug"
-            versionNameSuffix = "-debug"
+            applicationIdSuffix = ".modern"
+            versionNameSuffix = "-modern"
             isMinifyEnabled = false
         }
         release {

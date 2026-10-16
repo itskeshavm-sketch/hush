@@ -45,6 +45,7 @@ import dev.hush.chat.ui.components.EmptyState
 import dev.hush.chat.ui.components.InitialsAvatar
 import dev.hush.chat.ui.theme.HushAccent
 import dev.hush.chat.ui.theme.HushDanger
+import dev.hush.chat.ui.theme.HushSurfaceElevated
 import dev.hush.chat.ui.theme.HushTextSecondary
 import dev.hush.chat.ui.theme.HushTextTertiary
 import dev.hush.chat.ui.theme.HushWarning
@@ -85,7 +86,7 @@ fun RosterScreen(
                 title = {
                     Column {
                         Text(
-                            text = "HUSH",
+                            text = "HUSH Modern",
                             style = MaterialTheme.typography.titleLarge,
                             letterSpacing = androidx.compose.ui.unit.TextUnit(2f, androidx.compose.ui.unit.TextUnitType.Sp),
                         )
@@ -113,6 +114,9 @@ fun RosterScreen(
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background),
+            )
+            Box(
+                modifier = Modifier.fillMaxWidth().height(1.dp).background(HushSurfaceElevated),
             )
         },
     ) { padding ->

@@ -75,6 +75,24 @@ class DoubleRatchet private constructor(
     /** Skipped message keys, keyed by "<hex dh>|<n>" so a reordered delivery can still be decrypted. */
     private val skipped = ConcurrentHashMap<String, ByteArray>()
 
+    /**
+     * Headers of messages already opened, keyed by "<hex dh>|<n>".
+     *
+     * The replay test below only ignores replays under the CURRENT peer key.
+     * A duplicate from before a rotation (offline flush, retry and reset
+     * healing all re-send already-delivered ids) carries an older key, so it
+     * used to fall through to [dhRatchet] on a stale key and fail
+     * authentication — torching a healthy session and toasting "could not
+     * decrypt" for a conversation that visibly works. Any exact header replay
+     * is the same chain slot and therefore the same plaintext, so dropping it
+     * is always safe. Bounded: entries past the cap are forgotten and fall
+     * back to the fail-closed path, matching [MAX_SKIPPED] philosophy.
+     */
+    private val opened = object : LinkedHashMap<String, Unit>(MAX_OPENED, 0.75f, false) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Unit>): Boolean =
+            size > MAX_OPENED
+    }
+
     /** True once the first DHRatchet has run, i.e. we have keys to send with. */
     val isEstablished: Boolean get() = sendingChain != null
 
@@ -173,6 +191,11 @@ class DoubleRatchet private constructor(
 
         val dedupeKey = "$dhHex|${header.messageNumber}"
 
+        // Exact replay of an already-opened message. Checked before anything
+        // that mutates state: falling through would ratchet onto a stale key
+        // and poison the session for genuine messages behind it.
+        if (opened.containsKey(dedupeKey)) return null
+
         // A key derived earlier for an out-of-order message.
         //
         // Checked BEFORE the replay test. A message that was skipped over and
@@ -185,7 +208,9 @@ class DoubleRatchet private constructor(
         skipped[dedupeKey]?.let { stored ->
             skipped.remove(dedupeKey)
             receivedAny = true
-            return openWith(stored, nonce, sealed)
+            val plaintext = openWith(stored, nonce, sealed)
+            opened[dedupeKey] = Unit
+            return plaintext
         }
 
         // Replay of something we already opened. Checked for the peer's current
@@ -217,7 +242,9 @@ class DoubleRatchet private constructor(
 
         val key = advanceReceivingChain(header.dh, header.messageNumber)
         receivedAny = true
-        return openWith(key, nonce, sealed)
+        val plaintext = openWith(key, nonce, sealed)
+        opened[dedupeKey] = Unit
+        return plaintext
     }
 
     /**
@@ -387,6 +414,7 @@ class DoubleRatchet private constructor(
         ourRatchet.wipe()
         skipped.values.forEach { Primitives.wipe(it) }
         skipped.clear()
+        opened.clear()
     }
 
     companion object {
@@ -405,6 +433,13 @@ class DoubleRatchet private constructor(
          * undecryptable message with no way for the sender to know.
          */
         const val MAX_SKIPPED = 1_000
+
+        /**
+         * Cap on remembered opened-message headers. Same fail-closed logic as
+         * [MAX_SKIPPED]: past the cap a stale replay is refused (with the
+         * session left intact by the throw path) rather than silently dropped.
+         */
+        const val MAX_OPENED = 1_000
 
         /**
          * Build a session from an X3DH result.

@@ -258,6 +258,30 @@ class DoubleRatchetTest {
     }
 
     @Test
+    fun `a duplicate from before a rotation is dropped without poisoning the session`() {
+        val (alice, bob) = connectedPair()
+        val m1 = alice.encrypt("one".toByteArray())
+        val m2 = alice.encrypt("two".toByteArray())
+        assertEquals("one", String(bob.decrypt(m1)!!))
+        assertEquals("two", String(bob.decrypt(m2)!!))
+
+        // Bob replies, so both sides rotate onto new chain keys.
+        val reply = bob.encrypt("reply".toByteArray())
+        assertEquals("reply", String(alice.decrypt(reply)!!))
+        val m3 = alice.encrypt("three".toByteArray())
+        assertEquals("three", String(bob.decrypt(m3)!!))
+
+        // Stale duplicate of m1 under the pre-rotation key. Without an
+        // opened-message memory this ratchets onto the stale key and throws —
+        // and poisons the session for everything behind it.
+        assertNull("stale duplicate must return null, not throw", bob.decrypt(m1))
+
+        // The session must still be healthy afterwards.
+        val m4 = alice.encrypt("four".toByteArray())
+        assertEquals("four", String(bob.decrypt(m4)!!))
+    }
+
+    @Test
     fun `out-of-order delivery is handled via skipped keys`() {
         val (alice, bob) = connectedPair()
         val a = alice.encrypt("one".toByteArray())

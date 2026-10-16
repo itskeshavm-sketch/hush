@@ -524,6 +524,15 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
 
     private suspend fun syncRoster(incoming: List<dev.hush.chat.net.PeerInfo>) {
         val self = sessions.localPeerId()
+        // The relay reports every live socket including ours, so self must be
+        // filtered by id — but the id is null until welcome arrives (and after
+        // a duress wipe). `id != null` is always true, so filtering with an
+        // unknown self plants us in our own roster, where reconcile then keeps
+        // the ghost forever. Skip the sync; the next broadcast heals.
+        if (self.isNullOrEmpty()) return
+        // Remove a ghost planted by an earlier skip-less sync, if any. Self
+        // rows are never legitimate, with history or without.
+        runCatching { store.deletePeer(self) }
         val others = incoming.filter { it.id != self }
         store.upsertPeers(
             others.map { info ->

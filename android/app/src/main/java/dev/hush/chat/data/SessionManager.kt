@@ -292,7 +292,9 @@ class SessionManager(private val context: Context) {
     )
 
     fun noteLocalPeerId(id: String) {
-        localPeerId = id
+        // Never blank a known id: a malformed welcome must not reopen the
+        // self-in-roster hole that syncRoster guards below.
+        if (id.isNotEmpty()) localPeerId = id
     }
 
     fun localPeerId(): String? = localPeerId

@@ -115,3 +115,29 @@ data class OutboxItem(
     val kind: MessageKind = MessageKind.TEXT,
     val attachment: String? = null,
 )
+
+/**
+ * A private group: client-side only, invisible to non-members and to the
+ * relay. Membership is a local table; every coordination frame rides a 1:1
+ * E2E channel, so no other database ever holds a trace of the group.
+ */
+data class GroupInfo(
+    val id: String,
+    val name: String,
+    val adminId: String,
+    val createdAt: Long,
+    val memberIds: List<String> = emptyList(),
+    val unreadCount: Int = 0,
+) {
+    /** Two-letter monogram, same rule as peers. */
+    val initials: String
+        get() = name.trim()
+            .split(Regex("\\s+"))
+            .filter { it.isNotEmpty() }
+            .take(2)
+            .joinToString("") { it.first().uppercase() }
+            .ifEmpty { "#" }
+
+    override fun equals(other: Any?): Boolean = other is GroupInfo && other.id == id
+    override fun hashCode(): Int = id.hashCode()
+}

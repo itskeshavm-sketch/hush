@@ -134,6 +134,15 @@ fun ChatScreen(
     onVideoCall: () -> Unit,
     onVerify: () -> Unit,
     modifier: Modifier = Modifier,
+    // Group mode. All default off so 1:1 behavior is byte-identical:
+    // sender labels (names are labels, not identity), member-count subtitle,
+    // info screen instead of safety-number verify, no calls, no images in v1.
+    isGroup: Boolean = false,
+    groupSubtitle: String? = null,
+    showSenderNames: Boolean = false,
+    onOpenGroupInfo: (() -> Unit)? = null,
+    callsEnabled: Boolean = true,
+    imagesEnabled: Boolean = true,
 ) {
     var draft by remember { mutableStateOf("") }
     var timerMenuOpen by remember { mutableStateOf(false) }
@@ -171,7 +180,9 @@ fun ChatScreen(
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         modifier = Modifier
-                            .clickable(onClick = onVerify)
+                            .clickable(onClick = {
+                                if (isGroup) onOpenGroupInfo?.invoke() else onVerify()
+                            })
                             .padding(vertical = 4.dp),
                     ) {
                         InitialsAvatar(
@@ -188,6 +199,13 @@ fun ChatScreen(
                                 style = MaterialTheme.typography.titleMedium,
                                 color = MaterialTheme.colorScheme.onBackground,
                             )
+                            if (isGroup && groupSubtitle != null) {
+                                Text(
+                                    text = groupSubtitle,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = HushTextSecondary,
+                                )
+                            }
                             AnimatedVisibility(visible = peerTyping, enter = fadeIn(), exit = fadeOut()) {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
                                     TypingIndicator(color = HushTyping)
@@ -223,11 +241,13 @@ fun ChatScreen(
                     }
                 },
                 actions = {
-                    IconButton(onClick = onVoiceCall) {
-                        Icon(Icons.Filled.Call, contentDescription = "Voice call", tint = HushTextSecondary)
-                    }
-                    IconButton(onClick = onVideoCall) {
-                        Icon(Icons.Filled.Videocam, contentDescription = "Video call", tint = HushTextSecondary)
+                    if (callsEnabled) {
+                        IconButton(onClick = onVoiceCall) {
+                            Icon(Icons.Filled.Call, contentDescription = "Voice call", tint = HushTextSecondary)
+                        }
+                        IconButton(onClick = onVideoCall) {
+                            Icon(Icons.Filled.Videocam, contentDescription = "Video call", tint = HushTextSecondary)
+                        }
                     }
                     Box {
                         IconButton(onClick = { timerMenuOpen = true }) {
@@ -325,6 +345,7 @@ fun ChatScreen(
                         onLongPress = { onDelete(message) },
                         onKeep = { onKeep(message) },
                         onRetry = { onRetry(message) },
+                        showSenderName = showSenderNames,
                         modifier = Modifier.animateItem(
                             fadeInSpec = null, fadeOutSpec = null,
                             placementSpec = spring(
@@ -342,6 +363,7 @@ fun ChatScreen(
                     draft = it
                     if (it.isNotEmpty()) onTyping()
                 },
+                imagesEnabled = imagesEnabled,
                 onSend = {
                     if (draft.isNotBlank()) {
                         onSend(draft)
@@ -386,6 +408,7 @@ private fun MessageRow(
     onKeep: () -> Unit,
     onRetry: () -> Unit,
     modifier: Modifier = Modifier,
+    showSenderName: Boolean = false,
 ) {
     var menuOpen by remember { mutableStateOf(false) }
     val outgoing = message.isOutgoing
@@ -493,6 +516,18 @@ private fun MessageRow(
                             border = if (outgoing) null else BorderStroke(1.dp, HushBubbleEdge.copy(alpha = 0.6f)),
                         ) {
                             Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+                                // Group transcripts label who said what. Names
+                                // are labels, not identity — safety numbers
+                                // still live on the 1:1 sessions underneath.
+                                if (showSenderName && !outgoing && message.senderName.isNotBlank()) {
+                                    Text(
+                                        text = message.senderName,
+                                        style = MaterialTheme.typography.labelMedium,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = HushAccent,
+                                    )
+                                    Spacer(Modifier.height(2.dp))
+                                }
                                 // Body colour follows the bubble, not the page. The old code
                                 // used onBackground everywhere, which is dark ink on the
                                 // light theme — invisible on the blue outgoing bubble.
@@ -979,6 +1014,7 @@ private fun Composer(
     onDraftChange: (String) -> Unit,
     onSend: () -> Unit,
     onAttach: () -> Unit = {},
+    imagesEnabled: Boolean = true,
 ) {
     Column(modifier = Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface)) {
         Box(
@@ -991,12 +1027,14 @@ private fun Composer(
             .padding(horizontal = 12.dp, vertical = 10.dp),
         verticalAlignment = Alignment.Bottom,
     ) {
-        IconButton(onClick = onAttach) {
-            Icon(
-                imageVector = Icons.Filled.AttachFile,
-                contentDescription = "Send image",
-                tint = HushTextSecondary,
-            )
+        if (imagesEnabled) {
+            IconButton(onClick = onAttach) {
+                Icon(
+                    imageVector = Icons.Filled.AttachFile,
+                    contentDescription = "Send image",
+                    tint = HushTextSecondary,
+                )
+            }
         }
         TextField(
             value = draft,

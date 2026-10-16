@@ -20,6 +20,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Message
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.PersonAdd
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Badge
@@ -28,21 +30,29 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import dev.hush.chat.data.GroupInfo
 import dev.hush.chat.data.Peer
 import dev.hush.chat.net.RelayState
 import dev.hush.chat.ui.components.ConnectionBanner
 import dev.hush.chat.ui.components.EmptyState
 import dev.hush.chat.ui.components.InitialsAvatar
+import dev.hush.chat.ui.components.SectionHeader
 import dev.hush.chat.ui.theme.HushAccent
 import dev.hush.chat.ui.theme.HushDanger
 import dev.hush.chat.ui.theme.HushSurfaceElevated
@@ -63,9 +73,12 @@ import java.util.Locale
 @Composable
 fun RosterScreen(
     peers: List<Peer>,
+    groups: List<GroupInfo> = emptyList(),
     displayName: String,
     relayState: RelayState,
     onOpenPeer: (Peer) -> Unit,
+    onOpenGroup: (GroupInfo) -> Unit = {},
+    onCreateGroup: () -> Unit = {},
     onOpenSearch: () -> Unit,
     onOpenSettings: () -> Unit,
     onRetryRelay: () -> Unit,
@@ -75,7 +88,16 @@ fun RosterScreen(
     // (stale "online" for gone peers), so the list no longer claims it. The
     // app still tracks reachability internally to flush the offline outbox —
     // it just stopped printing guesses. Alphabetical, stable.
+    var query by remember { mutableStateOf("") }
     val sorted = peers.sortedBy { it.displayName.lowercase() }
+    val shownPeers = remember(sorted, query) {
+        if (query.isBlank()) sorted
+        else sorted.filter { it.displayName.contains(query.trim(), ignoreCase = true) }
+    }
+    val shownGroups = remember(groups, query) {
+        if (query.isBlank()) groups
+        else groups.filter { it.name.contains(query.trim(), ignoreCase = true) }
+    }
     val totalUnread = peers.sumOf { it.unreadCount }
 
     Scaffold(
@@ -128,7 +150,40 @@ fun RosterScreen(
         ) {
             ConnectionBanner(state = relayState, onRetry = onRetryRelay)
 
-            if (peers.isEmpty()) {
+            // Username search: the relay is one public room, so finding a
+            // person is filtering the list, not a server query.
+            OutlinedTextField(
+                value = query,
+                onValueChange = { query = it },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp, vertical = 8.dp),
+                placeholder = { Text("Search people and groups", color = HushTextTertiary) },
+                leadingIcon = {
+                    Icon(Icons.Filled.Search, contentDescription = null, tint = HushTextTertiary)
+                },
+                trailingIcon = {
+                    if (query.isNotEmpty()) {
+                        IconButton(onClick = { query = "" }) {
+                            Icon(
+                                Icons.Filled.Close,
+                                contentDescription = "Clear search",
+                                tint = HushTextTertiary,
+                            )
+                        }
+                    }
+                },
+                singleLine = true,
+                shape = RoundedCornerShape(12.dp),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor = HushAccent,
+                    unfocusedBorderColor = androidx.compose.ui.graphics.Color.Transparent,
+                    focusedContainerColor = HushSurfaceElevated,
+                    unfocusedContainerColor = HushSurfaceElevated,
+                ),
+            )
+
+            if (peers.isEmpty() && groups.isEmpty()) {
                 // Nothing to configure, nothing to share, nothing to type.
                 //
                 // Every install points at the same public relay by default, so
@@ -148,8 +203,84 @@ fun RosterScreen(
                 modifier = Modifier.fillMaxSize(),
                 contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 24.dp),
             ) {
-                items(sorted, key = { it.id }) { peer ->
-                    PeerRow(peer, onClick = { onOpenPeer(peer) })
+                if (shownGroups.isNotEmpty()) {
+                    item(key = "groups-header") {
+                        SectionHeader("Groups")
+                    }
+                    items(shownGroups, key = { "g:" + it.id }) { group ->
+                        GroupRow(group, onClick = { onOpenGroup(group) })
+                    }
+                    item(key = "new-group") {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable(onClick = onCreateGroup)
+                                .padding(horizontal = 20.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Icon(
+                                Icons.Filled.PersonAdd,
+                                contentDescription = null,
+                                tint = HushAccent,
+                                modifier = Modifier.size(24.dp),
+                            )
+                            Spacer(Modifier.width(14.dp))
+                            Text(
+                                text = "New private group",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = HushAccent,
+                            )
+                        }
+                    }
+                } else if (query.isBlank()) {
+                    item(key = "new-group") {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable(onClick = onCreateGroup)
+                                .padding(horizontal = 20.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Icon(
+                                Icons.Filled.PersonAdd,
+                                contentDescription = null,
+                                tint = HushAccent,
+                                modifier = Modifier.size(24.dp),
+                            )
+                            Spacer(Modifier.width(14.dp))
+                            Text(
+                                text = "New private group",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = HushAccent,
+                            )
+                        }
+                    }
+                }
+                if (shownPeers.isNotEmpty()) {
+                    if (shownGroups.isNotEmpty() || query.isNotBlank()) {
+                        item(key = "people-header") {
+                            SectionHeader("People")
+                        }
+                    }
+                    items(shownPeers, key = { it.id }) { peer ->
+                        PeerRow(peer, onClick = { onOpenPeer(peer) })
+                    }
+                }
+                if (shownPeers.isEmpty() && shownGroups.isEmpty() && query.isNotBlank()) {
+                    item(key = "no-match") {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 24.dp),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text(
+                                text = "Nobody called that is here",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = HushTextSecondary,
+                            )
+                        }
+                    }
                 }
             }        }
     }
@@ -201,6 +332,48 @@ private fun PeerRow(peer: Peer, onClick: () -> Unit) {
         if (peer.unreadCount > 0) {
             Badge(containerColor = HushAccent) {
                 Text("${peer.unreadCount}", color = androidx.compose.ui.graphics.Color.White)
+            }
+        }
+    }
+}
+
+@Composable
+private fun GroupRow(group: GroupInfo, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(horizontal = 20.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        InitialsAvatar(
+            initials = group.initials,
+            seed = group.id.fold(0) { acc, c -> (acc * 31 + c.code) and 0x7FFFFFFF },
+            size = 46.dp,
+            online = null,
+            verified = false,
+        )
+
+        Spacer(Modifier.width(14.dp))
+
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = group.name,
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.onBackground,
+                maxLines = 1,
+            )
+            Text(
+                text = "${group.memberIds.size} members" +
+                    if (group.unreadCount > 0) " · ${group.unreadCount} unread" else "",
+                style = MaterialTheme.typography.bodySmall,
+                color = HushTextSecondary,
+            )
+        }
+
+        if (group.unreadCount > 0) {
+            Badge(containerColor = HushAccent) {
+                Text("${group.unreadCount}", color = androidx.compose.ui.graphics.Color.White)
             }
         }
     }

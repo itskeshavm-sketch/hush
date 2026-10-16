@@ -902,7 +902,9 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
         if (jpeg.isEmpty()) return
 
         val now = System.currentTimeMillis()
-        store.insertMessage(
+        // Same first-wins rule as inbound text: a duplicate chunk set
+        // re-completing must not move or re-stamp the row.
+        store.insertMessageIfAbsent(
             Message(
                 id = chunk.msgId,
                 conversationId = from,
@@ -1162,12 +1164,14 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
         when (result) {
             is dev.hush.chat.data.InboundResult.Text -> {
                 val now = System.currentTimeMillis()
-                store.insertMessage(
+                // First arrival wins (see insertMessageIfAbsent): a redelivery
+                // must not re-stamp or move the row.
+                store.insertMessageIfAbsent(
                     Message(
                         // Sender-stable id: the same value the sender holds, so
                         // a later delete frame addressed by that id matches.
-                        // CONFLICT_REPLACE in the store makes a redelivery
-                        // idempotent rather than a duplicate.
+                        // IGNORE in the store makes a redelivery a no-op
+                        // rather than a duplicate or a reorder.
                         id = result.msgId,
                         conversationId = from,
                         senderId = from,

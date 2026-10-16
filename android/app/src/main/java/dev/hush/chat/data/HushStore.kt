@@ -322,6 +322,47 @@ class HushStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
         }
     }
 
+    /**
+     * Insert only when no row holds this id. For inbound messages addressed by
+     * sender-stable id.
+     *
+     * Redelivery is normal here (offline flush, retry, reset healing all
+     * re-send the same id), and REPLACE on a duplicate deletes + re-inserts:
+     * new rowid, new receipt-time `sent_at`, recomputed expiry — the message
+     * jumps to the bottom and its disappearing deadline extends. First
+     * arrival wins instead: same content, original position, original
+     * deadline. Own sends and system notices use fresh UUIDs and keep
+     * [insertMessage]; only the two inbound sites (text, image assembly) come
+     * here.
+     */
+    suspend fun insertMessageIfAbsent(message: Message): Boolean = withContext(Dispatchers.IO) {
+        ioLock.write {
+            val db = writableDatabase
+            db.insertWithOnConflict(
+                "messages",
+                null,
+                ContentValues().apply {
+                    put("id", message.id)
+                    put("conversation_id", message.conversationId)
+                    put("sender_id", message.senderId)
+                    put("sender_name", message.senderName)
+                    put("body", message.body)
+                    put("sent_at", message.sentAt)
+                    put("state", message.state.ordinal)
+                    put("kind", message.kind.ordinal)
+                    put("deleted", if (message.deletedForEveryone) 1 else 0)
+                    message.attachmentLabel?.let { put("attachment", it) }
+                    put("seen_at", message.seenAt)
+                    put("expires_at", message.expiresAt)
+                    put("exp_seen_ms", message.expirySeenMs)
+                    put("kept", if (message.kept) 1 else 0)
+                    put("expired", if (message.expired) 1 else 0)
+                },
+                SQLiteDatabase.CONFLICT_IGNORE,
+            ) != -1L
+        }
+    }
+
     suspend fun updateState(messageId: String, state: DeliveryState) = withContext(Dispatchers.IO) {
         ioLock.write {
             writableDatabase.execSQL(

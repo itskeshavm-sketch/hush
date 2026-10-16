@@ -371,7 +371,7 @@ class HushStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
                            seen_at, expires_at, exp_seen_ms, kept, expired
                     FROM messages
                     WHERE conversation_id = ?
-                    ORDER BY sent_at DESC
+                    ORDER BY sent_at DESC, rowid DESC
                     LIMIT ?
                     """.trimIndent(),
                     arrayOf(conversationId, limit.toString()),
@@ -489,7 +489,7 @@ class HushStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
                     SELECT id FROM messages
                     WHERE conversation_id = ? AND sender_id != ?
                       AND deleted = 0 AND seen_at = 0 AND exp_seen_ms > 0
-                    ORDER BY sent_at ASC
+                    ORDER BY sent_at ASC, rowid ASC
                     LIMIT ?
                     """.trimIndent(),
                     arrayOf(conversationId, Message.LOCAL_SENTINEL, limit.toString()),
@@ -533,7 +533,7 @@ class HushStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
                     SELECT id, body, kind, attachment FROM messages
                     WHERE conversation_id = ? AND sender_id = ?
                       AND deleted = 0 AND state != ?
-                    ORDER BY sent_at ASC
+                    ORDER BY sent_at ASC, rowid ASC
                     LIMIT ?
                     """.trimIndent(),
                     arrayOf(
@@ -660,7 +660,7 @@ class HushStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
                 LEFT JOIN peers  p ON p.id = m.conversation_id
                 WHERE messages_fts MATCH ?
                   AND m.deleted = 0
-                ORDER BY m.sent_at DESC
+                ORDER BY m.sent_at DESC, m.rowid DESC
                 LIMIT ?
                 """.trimIndent(),
                 arrayOf("\"$phrase\"", limit.toString()),

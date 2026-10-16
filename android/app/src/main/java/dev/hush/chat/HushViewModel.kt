@@ -659,18 +659,14 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
                     emitToast("Can't reach ${peer?.displayName ?: "peer"} yet — message queued, sends when they're back")
                 }
             } else if (relay.sendMessage(peerId, sealed)) {
-                // The socket write succeeding does NOT mean the peer got it:
-                // the relay drops sends for offline peers and reports
-                // unknown_peer async. If the roster already knows they are
-                // offline, keep this PENDING so the flush picks it up instead
-                // of stranding it as SENT. (Stale-online races are repaired
-                // by the demote in handleRelayError.)
-                if (peer?.online == false) {
-                    store.updateState(id, DeliveryState.FAILED)
-                    emitToast("${peer.displayName.ifEmpty { "Peer" }} is offline — message queued, sends when they're back")
-                } else {
-                    store.updateState(id, DeliveryState.SENT)
-                }
+                // Socket-write success is optimistic: the relay drops sends
+                // for offline peers and reports unknown_peer async, and the
+                // demote in handleRelayError puts those rows back in the
+                // queue. The local roster is NOT consulted here on purpose —
+                // it polls at 30s and goes stale the moment a peer returns,
+                // so gating on it turned every just-returned peer into a false
+                // "offline" with a retry badge (the bug in the report).
+                store.updateState(id, DeliveryState.SENT)
             } else {
                 store.updateState(id, DeliveryState.FAILED)
                 emitToast("Not connected — message held")
@@ -784,12 +780,9 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
             store.insertMessage(message)
             _messages.value = store.loadMessages(peerId)
             if (sendImageBytes(peerId, id, "", jpegBytes)) {
-                if (_peers.value.firstOrNull { it.id == peerId }?.online == false) {
-                    store.updateState(id, DeliveryState.FAILED)
-                    emitToast("They're offline — image queued, sends when they're back")
-                } else {
-                    store.updateState(id, DeliveryState.SENT)
-                }
+                // Same optimistic rule as text (see sendMessage): no roster
+                // gate, relay error demotes.
+                store.updateState(id, DeliveryState.SENT)
             } else {
                 store.updateState(id, DeliveryState.FAILED)
                 emitToast("Can't reach them yet — image queued, sends when they're back")
@@ -963,6 +956,11 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             store.updateState(messageId, DeliveryState.PENDING)
             _messages.value = store.loadMessages(peerId)
+            // Nudge presence before re-sealing: the bundle lives in the roster
+            // frame, so a stale frame means no bundle and a guaranteed retry
+            // failure. Fire-and-forget — the current attempt proceeds with
+            // whatever we have; the next roster event heals the rest.
+            runCatching { relay.refreshRoster() }
             val item = dev.hush.chat.data.OutboxItem(
                 id = messageId,
                 body = message.body,

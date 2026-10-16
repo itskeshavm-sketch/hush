@@ -46,6 +46,8 @@ sealed interface InboundResult {
         val msgId: String,
         val expSentMs: Long? = null,
         val expSeenMs: Long? = null,
+        /** Set only for group messages (payload v4): the group's id. */
+        val groupId: String? = null,
     ) : InboundResult
 
     /** WebRTC signaling for an active call. */
@@ -70,6 +72,16 @@ sealed interface InboundResult {
         val data: ByteArray,
         val expSentMs: Long?,
         val expSeenMs: Long?,
+    ) : InboundResult
+
+    /** Group membership control (payload v5). Never rendered as a bubble. */
+    data class GroupControl(
+        val conversationId: String,
+        val from: String,
+        val fromName: String,
+        val groupId: String,
+        val op: String,
+        val payload: org.json.JSONObject,
     ) : InboundResult
 
     /** Nothing to do — duplicate, system noise, or a non-text message kind. */
@@ -516,6 +528,36 @@ class SessionManager(private val context: Context) {
                 // a row: without all chunks in range there is nothing to show.
                 return InboundResult.Ignored
             }
+            if (version == 4) {
+                // Group text: identical contract to v2, routed to the group
+                // transcript by "g". Bounds match v2 so a group's timers obey
+                // the same sender-governs rule with no extra handshake.
+                val id = parsed.optString("id")
+                val body = parsed.optString("body")
+                val groupId = parsed.optString("g")
+                if (id.isNotEmpty() && groupId.isNotEmpty() && groupId.length <= MAX_GROUP_ID_CHARS) {
+                    return InboundResult.Text(
+                        groupId, peerId, "", body, System.currentTimeMillis(), id,
+                        expSentMs = parsed.optLong("ss", -1L).takeIf { it in 1..MAX_TIMER_MS },
+                        expSeenMs = parsed.optLong("sn", -1L).takeIf { it in 1..MAX_TIMER_MS },
+                        groupId = groupId,
+                    )
+                }
+                return InboundResult.Ignored
+            }
+            if (version == 5) {
+                // Group control: never a bubble. Ops are validated against
+                // size caps here; membership authority (admin-only) is checked
+                // by the caller, which knows the group's current admin.
+                val op = parsed.optString("op")
+                val groupId = parsed.optString("g")
+                if (op in GROUP_OPS && groupId.isNotEmpty() && groupId.length <= MAX_GROUP_ID_CHARS &&
+                    parsed.toString().length <= MAX_CONTROL_BYTES
+                ) {
+                    return InboundResult.GroupControl(peerId, peerId, "", groupId, op, parsed)
+                }
+                return InboundResult.Ignored
+            }
         }
         return InboundResult.Text(
             peerId, peerId, "", plaintext, System.currentTimeMillis(),
@@ -558,6 +600,42 @@ class SessionManager(private val context: Context) {
             .put("ch", index).put("n", total).put("data", dataB64)
         if (expSentMs != null && expSentMs in 1..MAX_TIMER_MS) o.put("ss", expSentMs)
         if (expSeenMs != null && expSeenMs in 1..MAX_TIMER_MS) o.put("sn", expSeenMs)
+        return o.toString().toByteArray()
+    }
+
+    /**
+     * Seal a group text (payload v4). Same stable-id/timer contract as
+     * [sealText]; the group id rides inside so the receiver files it in the
+     * group transcript. Fanned out per member — one seal per 1:1 session.
+     */
+    fun sealGroupText(
+        id: String,
+        groupId: String,
+        body: String,
+        expSentMs: Long?,
+        expSeenMs: Long?,
+    ): ByteArray {
+        val o = org.json.JSONObject().put("v", 4).put("id", id).put("body", body).put("g", groupId)
+        if (expSentMs != null && expSentMs in 1..MAX_TIMER_MS) o.put("ss", expSentMs)
+        if (expSeenMs != null && expSeenMs in 1..MAX_TIMER_MS) o.put("sn", expSeenMs)
+        return o.toString().toByteArray()
+    }
+
+    /**
+     * Seal a group control frame (payload v5). The caller builds [fields];
+     * "v"/"op"/"g" are stamped here so callers cannot forge the version.
+     */
+    fun sealGroupControl(op: String, groupId: String, fields: Map<String, Any?> = emptyMap()): ByteArray {
+        val o = org.json.JSONObject().put("v", 5).put("op", op).put("g", groupId)
+        fields.forEach { (k, v) ->
+            when (v) {
+                null -> org.json.JSONObject.NULL.let { o.put(k, it) }
+                is String -> if (v.length <= MAX_CONTROL_BYTES) o.put(k, v)
+                is Number, is Boolean -> o.put(k, v)
+                is org.json.JSONArray -> if (v.toString().length <= MAX_CONTROL_BYTES) o.put(k, v)
+                else -> Unit
+            }
+        }
         return o.toString().toByteArray()
     }
 
@@ -674,6 +752,19 @@ class SessionManager(private val context: Context) {
         const val MAX_CHUNK_RAW = 36 * 1024
         const val MAX_CHUNK_B64 = 64 * 1024
         const val MAX_IMAGE_CHUNKS = 80
+
+        /**
+         * Group bounds. Member cap is product policy (fan-out cost per send);
+         * id/history/control caps are attacker bounds: every v5 field is
+         * attacker-controlled JSON, so oversized frames die in [interpret]
+         * before anything is allocated or stored.
+         */
+        const val MAX_GROUP_MEMBERS = 50
+        const val MAX_GROUP_ID_CHARS = 64
+        const val MAX_GROUP_NAME_CHARS = 48
+        const val MAX_HISTORY_ITEMS = 20
+        const val MAX_CONTROL_BYTES = 128 * 1024
+        val GROUP_OPS = setOf("invite", "add", "remove", "leave", "rename")
 
         @JvmStatic
         val AAD_V1: ByteArray = "HUSH/msg/v1".toByteArray()

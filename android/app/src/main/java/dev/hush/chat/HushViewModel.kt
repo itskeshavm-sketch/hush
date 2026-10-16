@@ -4,6 +4,7 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.hush.chat.data.DeliveryState
+import dev.hush.chat.data.GroupInfo
 import dev.hush.chat.data.HushStore
 import dev.hush.chat.data.Message
 import dev.hush.chat.data.MessageKind
@@ -35,6 +36,9 @@ sealed interface Screen {
     data object Settings : Screen
     data class SafetyNumber(val peerId: String, val peerName: String) : Screen
     data class PeerInfo(val peerId: String, val peerName: String) : Screen
+    data class Group(val groupId: String, val groupName: String) : Screen
+    data object NewGroup : Screen
+    data class GroupDetail(val groupId: String) : Screen
 }
 
 /** One-shot user-facing error. */
@@ -80,6 +84,25 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _searchHits = MutableStateFlow<List<SearchHit>>(emptyList())
     val searchHits: StateFlow<List<SearchHit>> = _searchHits.asStateFlow()
+
+    private val _groups = MutableStateFlow<List<GroupInfo>>(emptyList())
+    val groups: StateFlow<List<GroupInfo>> = _groups.asStateFlow()
+
+    /** Our own routing id, for marking self rows in group UI. */
+    val selfId: String? get() = sessions.localPeerId()
+
+    /** Id of the open conversation, 1:1 or group — one helper for all reloads. */
+    private fun openConversationId(): String? = when (val s = _screen.value) {
+        is Screen.Chat -> s.peerId
+        is Screen.Group -> s.groupId
+        else -> null
+    }
+
+    private suspend fun reloadOpen(conversationId: String) {
+        if (openConversationId() == conversationId) {
+            _messages.value = store.loadMessages(conversationId)
+        }
+    }
 
     private val _toast = MutableStateFlow<Toast?>(null)
     val toast: StateFlow<Toast?> = _toast.asStateFlow()
@@ -507,6 +530,10 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
             if (id != null) {
                 runCatching {
                     store.demoteRecent(id, System.currentTimeMillis() - OFFLINE_DEMOTE_WINDOW_MS)
+                    // Group analogue: re-queue this member's recent group
+                    // sends so the per-member flush picks them up.
+                    store.recentGroupSendsForMember(id, System.currentTimeMillis() - OFFLINE_DEMOTE_WINDOW_MS)
+                        .forEach { store.addGroupPending(it.second, id) }
                 }
                 if ((_screen.value as? Screen.Chat)?.peerId == id) {
                     runCatching { _messages.value = store.loadMessages(id) }
@@ -581,8 +608,10 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
         // outbox until the next reconnect.
         nowOnline.forEach { id ->
             if (store.hasPending(id)) flushPendingMessages(id)
+            flushGroupForMember(id)
         }
         lastOnlineIds = nowOnline
+        refreshGroups()
     }
 
     // -------------------------------------------------------------------------
@@ -964,7 +993,18 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
         // Re-send the SAME id, not a fresh message. A retry that mints a new
         // id leaves the recipient holding an id we no longer reference, so a
         // later delete-for-everyone or receipt addresses nothing on their side.
+        // Group rows re-fan-out to current members; 1:1 rows take the old path.
         viewModelScope.launch {
+            if (store.groupInfo(message.conversationId) != null) {
+                if (retryGroupMessage(message.conversationId, messageId)) {
+                    _messages.value = store.loadMessages(message.conversationId)
+                } else {
+                    store.updateState(messageId, DeliveryState.FAILED)
+                    _messages.value = store.loadMessages(message.conversationId)
+                    emitToast("Still can't reach them — kept in the queue")
+                }
+                return@launch
+            }
             store.updateState(messageId, DeliveryState.PENDING)
             _messages.value = store.loadMessages(peerId)
             // Nudge presence before re-sealing: the bundle lives in the roster
@@ -1010,6 +1050,547 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
             store.markDeletedForEveryone(messageId)
             relay.sendDelete(peerId, messageId)
             _messages.value = store.loadMessages(peerId)
+        }
+    }
+
+    /** Delete a group message for everyone: fan the delete out to all members. */
+    fun deleteGroupMessageForEveryone(groupId: String, messageId: String) {
+        viewModelScope.launch {
+            val members = store.groupInfo(groupId)?.memberIds ?: return@launch
+            val self = sessions.localPeerId()
+            store.markDeletedForEveryone(messageId)
+            members.filter { it != self }.forEach { relay.sendDelete(it, messageId) }
+            reloadOpen(groupId)
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Private groups
+    //
+    // A group is a client-side object: id, name, member list. The relay never
+    // learns groups exist — every coordination frame rides an ordinary 1:1 E2E
+    // envelope, and group texts are fanned out per member over the existing
+    // 1:1 sessions. A non-member's database holds no trace of the group.
+    // -------------------------------------------------------------------------
+
+    fun openGroup(groupId: String) {
+        val info = _groups.value.firstOrNull { it.id == groupId } ?: return
+        _screen.value = Screen.Group(groupId, info.name)
+        viewModelScope.launch {
+            _messages.value = store.loadMessages(groupId)
+            flushGroupSeenReceipts(groupId)
+        }
+    }
+
+    /**
+     * Create a group and invite the members. The creator is always a member;
+     * membership caps at [SessionManager.MAX_GROUP_MEMBERS] including self.
+     */
+    fun createGroup(name: String, memberIds: List<String>) {
+        val cleanName = name.trim().take(SessionManager.MAX_GROUP_NAME_CHARS).ifEmpty { "Group" }
+        val self = sessions.localPeerId() ?: return
+        val members = (memberIds.filter { it != self }.distinct()
+            .take(SessionManager.MAX_GROUP_MEMBERS - 1))
+        viewModelScope.launch {
+            val groupId = "g_" + UUID.randomUUID().toString()
+            val now = System.currentTimeMillis()
+            store.upsertGroup(groupId, cleanName, self, now)
+            store.setGroupMembers(groupId, listOf(self) + members, now)
+            store.insertMessage(
+                Message(
+                    id = UUID.randomUUID().toString(),
+                    conversationId = groupId,
+                    senderId = self,
+                    senderName = "",
+                    body = "You created the group $cleanName",
+                    sentAt = now,
+                    state = DeliveryState.SENT,
+                    kind = MessageKind.SYSTEM,
+                    deletedForEveryone = false,
+                )
+            )
+            _groups.value = store.listGroups()
+            members.forEach { sendInvite(it, groupId, withHistory = false) }
+            _screen.value = Screen.Group(groupId, cleanName)
+            _messages.value = store.loadMessages(groupId)
+        }
+    }
+
+    /**
+     * Send one member their invite: meta + full member list + last-20 history.
+     * Idempotent on receipt, so re-sends are safe — but history is only
+     * attached when asked, keeping roster-event re-sends cheap.
+     */
+    private suspend fun sendInvite(memberId: String, groupId: String, withHistory: Boolean) {
+        val info = store.groupInfo(groupId) ?: return
+        val historyJson = org.json.JSONArray()
+        if (withHistory) {
+            // Forwarded under ORIGINAL ids so future deletes still match on
+            // every side. Timers: seen-based durations survive verbatim;
+            // sent-based ones survive as remaining time (absolute deadlines
+            // cannot cross devices with skewed clocks).
+            val now = System.currentTimeMillis()
+            store.lastTexts(groupId, SessionManager.MAX_HISTORY_ITEMS).forEach { m ->
+                val ss = if (m.expirySeenMs == 0L && m.expiresAt > now) m.expiresAt - now else null
+                historyJson.put(
+                    org.json.JSONObject()
+                        .put("id", m.id).put("body", m.body)
+                        .put("from", m.senderId).put("fromName", m.senderName)
+                        .put("at", m.sentAt).put("sn", m.expirySeenMs)
+                        .put("ss", ss ?: -1L),
+                )
+            }
+        }
+        val members = org.json.JSONArray()
+        info.memberIds.forEach { members.put(it) }
+        val sealed = sealFor(memberId) {
+            sessions.sealGroupControl(
+                "invite", groupId,
+                mapOf(
+                    "name" to info.name, "admin" to info.adminId,
+                    "created" to info.createdAt, "members" to members,
+                    "history" to historyJson,
+                ),
+            )
+        } ?: run {
+            store.addGroupPending(INVITE_PENDING_PREFIX + groupId, memberId)
+            return
+        }
+        if (!relay.sendMessage(memberId, sealed)) {
+            store.addGroupPending(INVITE_PENDING_PREFIX + groupId, memberId)
+        }
+    }
+
+    /**
+     * Seal bytes for one member, or null when there is no usable session
+     * (no bundle yet, or a non-app client). Callers queue and retry later.
+     */
+    private suspend fun sealFor(memberId: String, seal: suspend () -> ByteArray): ByteArray? {
+        val bundleJson = prekeyFor(memberId) ?: return null
+        return runCatching { sessions.encrypt(memberId, bundleJson, seal()) }.getOrNull()
+    }
+
+    /** System notice inside a group transcript. */
+    private suspend fun groupNotice(groupId: String, body: String) {
+        store.insertMessage(
+            Message(
+                id = UUID.randomUUID().toString(),
+                conversationId = groupId,
+                senderId = sessions.localPeerId() ?: "",
+                senderName = "",
+                body = body,
+                sentAt = System.currentTimeMillis(),
+                state = DeliveryState.SENT,
+                kind = MessageKind.SYSTEM,
+                deletedForEveryone = false,
+            )
+        )
+        reloadOpen(groupId)
+    }
+
+    /** Refresh the cached group list. */
+    private suspend fun refreshGroups() {
+        _groups.value = store.listGroups()
+    }
+
+    /** Display name for a member id in group notices; never a raw p_ id. */
+    private fun memberName(peerId: String): String {
+        if (peerId == sessions.localPeerId()) return "You"
+        return peerNameFor(peerId) ?: "Someone"
+    }
+
+    /**
+     * Send a group text: stored once, fanned out per member. Members without
+     * a usable session, or whose relay delivery fails, go on the per-member
+     * pending queue; the async unknown_peer error path adds the rest.
+     */
+    fun sendGroupText(groupId: String, body: String) {
+        val text = body.trim()
+        if (text.isEmpty()) return
+        viewModelScope.launch {
+            val info = store.groupInfo(groupId) ?: return@launch
+            val self = sessions.localPeerId() ?: return@launch
+            if (self !in info.memberIds) return@launch
+            val id = UUID.randomUUID().toString()
+            val now = System.currentTimeMillis()
+            val (sentTtl, seenTtl) = policyFor(groupId)
+            val message = Message(
+                id = id,
+                conversationId = groupId,
+                senderId = Message.LOCAL_SENTINEL,
+                senderName = displayName,
+                body = text,
+                sentAt = now,
+                state = DeliveryState.PENDING,
+                kind = MessageKind.TEXT,
+                deletedForEveryone = false,
+                expiresAt = when {
+                    sentTtl != null -> now + sentTtl
+                    seenTtl != null -> now + maxOf(seenTtl, SEEN_BACKSTOP_MS)
+                    else -> 0L
+                },
+                expirySeenMs = seenTtl ?: 0L,
+            )
+            store.insertMessage(message)
+            _messages.value = store.loadMessages(groupId)
+            var anyFail = false
+            info.memberIds.filter { it != self }.forEach { member ->
+                val sealed = sealFor(member) {
+                    sessions.sealGroupText(id, groupId, text, sentTtl, seenTtl)
+                }
+                if (sealed == null || !relay.sendMessage(member, sealed)) {
+                    store.addGroupPending(id, member)
+                    anyFail = true
+                }
+            }
+            store.updateState(id, if (anyFail) DeliveryState.FAILED else DeliveryState.SENT)
+            _messages.value = store.loadMessages(groupId)
+        }
+    }
+
+    /**
+     * Re-send everything owed to one returned member: queued texts plus any
+     * still-unacknowledged invite. Cheap existence check first — roster
+     * events are frequent and this runs on every one.
+     */
+    private suspend fun flushGroupForMember(memberId: String) {
+        val pending = store.pendingGroupForMember(memberId)
+        if (pending.isEmpty()) return
+        var touched: String? = null
+        pending.forEach { (groupId, item) ->
+            val info = store.groupInfo(groupId) ?: run {
+                store.clearGroupPending(item.id, memberId)
+                return@forEach
+            }
+            val self = sessions.localPeerId() ?: return@forEach
+            if (self !in info.memberIds || memberId !in info.memberIds) {
+                store.clearGroupPending(item.id, memberId)
+                return@forEach
+            }
+            if (item.id.startsWith(INVITE_PENDING_PREFIX)) {
+                sendInvite(memberId, groupId, withHistory = true)
+                if (store.groupInfo(groupId) != null) {
+                    // Invite re-send is idempotent; the entry clears when the
+                    // member's first group text proves they joined.
+                }
+                touched = groupId
+                return@forEach
+            }
+            val (sentTtl, seenTtl) = policyFor(groupId)
+            val sealed = sealFor(memberId) {
+                sessions.sealGroupText(item.id, groupId, item.body, sentTtl, seenTtl)
+            } ?: return@forEach
+            if (relay.sendMessage(memberId, sealed)) {
+                store.clearGroupPending(item.id, memberId)
+                touched = groupId
+            }
+        }
+        touched?.let { reloadOpen(it) }
+    }
+
+    /** Admin adds members: invite (with history) for the new, notice for all. */
+    fun addGroupMembers(groupId: String, peerIds: List<String>) {
+        viewModelScope.launch {
+            val info = store.groupInfo(groupId) ?: return@launch
+            val self = sessions.localPeerId() ?: return@launch
+            if (info.adminId != self) {
+                emitToast("Only the admin can add members")
+                return@launch
+            }
+            val fresh = peerIds.filter { it != self && it !in info.memberIds }.distinct()
+                .take((SessionManager.MAX_GROUP_MEMBERS - info.memberIds.size).coerceAtLeast(0))
+            if (fresh.isEmpty()) return@launch
+            val now = System.currentTimeMillis()
+            fresh.forEach { store.addGroupMember(groupId, it, now) }
+            val admin = store.groupAdmin(groupId) ?: self
+            store.renameGroup(groupId, info.name, admin)
+            val names = fresh.joinToString { memberName(it) }
+            controlToAll(groupId, "add", mapOf("member" to fresh.first(), "members" to fresh.joinToString(",")))
+            groupNotice(groupId, "You added $names")
+            fresh.forEach { sendInvite(it, groupId, withHistory = true) }
+            refreshGroups()
+        }
+    }
+
+    /** Admin removes a member; the removed phone wipes the group. */
+    fun removeGroupMember(groupId: String, peerId: String) {
+        viewModelScope.launch {
+            val info = store.groupInfo(groupId) ?: return@launch
+            val self = sessions.localPeerId() ?: return@launch
+            if (info.adminId != self || peerId == self || peerId !in info.memberIds) return@launch
+            applyMemberLeft(groupId, peerId, byAdmin = true)
+        }
+    }
+
+    /** Leave (and wipe) a group. Admin passes to the longest-standing member. */
+    fun leaveGroup(groupId: String) {
+        viewModelScope.launch {
+            val info = store.groupInfo(groupId) ?: return@launch
+            val self = sessions.localPeerId() ?: return@launch
+            if (self !in info.memberIds) return@launch
+            info.memberIds.filter { it != self }.forEach { member ->
+                sealFor(member) {
+                    sessions.sealGroupControl("leave", groupId, mapOf("member" to self))
+                }?.let { relay.sendMessage(member, it) }
+            }
+            wipeGroup(groupId)
+            _screen.value = Screen.Roster
+        }
+    }
+
+    /** Admin renames the group; the name syncs to every member. */
+    fun renameGroup(groupId: String, name: String) {
+        val clean = name.trim().take(SessionManager.MAX_GROUP_NAME_CHARS)
+        if (clean.isEmpty()) return
+        viewModelScope.launch {
+            val info = store.groupInfo(groupId) ?: return@launch
+            val self = sessions.localPeerId() ?: return@launch
+            if (info.adminId != self) {
+                emitToast("Only the admin can rename the group")
+                return@launch
+            }
+            store.renameGroup(groupId, clean, self)
+            controlToAll(groupId, "rename", mapOf("name" to clean))
+            groupNotice(groupId, "You renamed the group to $clean")
+            refreshGroups()
+            if (openConversationId() == groupId) {
+                _screen.value = Screen.Group(groupId, clean)
+            }
+        }
+    }
+
+    /** Best-effort control frame to every other member. */
+    private suspend fun controlToAll(groupId: String, op: String, fields: Map<String, Any?> = emptyMap()) {
+        val info = store.groupInfo(groupId) ?: return
+        val self = sessions.localPeerId() ?: return
+        info.memberIds.filter { it != self }.forEach { member ->
+            sealFor(member) { sessions.sealGroupControl(op, groupId, fields) }
+                ?.let { relay.sendMessage(member, it) }
+        }
+    }
+
+    /**
+     * Shared remove path for admin-remove and leave: drop the member,
+     * recompute the deterministic admin, notify the transcript.
+     */
+    private suspend fun applyMemberLeft(groupId: String, peerId: String, byAdmin: Boolean) {
+        val info = store.groupInfo(groupId) ?: return
+        val self = sessions.localPeerId()
+        store.removeGroupMember(groupId, peerId)
+        val admin = store.groupAdmin(groupId)
+        if (admin != null) store.renameGroup(groupId, info.name, admin)
+        val name = if (peerId == self) "You" else memberName(peerId)
+        if (byAdmin) {
+            sealFor(peerId) {
+                sessions.sealGroupControl("remove", groupId, mapOf("member" to peerId))
+            }?.let { relay.sendMessage(peerId, it) }
+            controlToAll(groupId, "remove", mapOf("member" to peerId))
+            groupNotice(groupId, "$name ${if (peerId == self) "left" else "was removed"}")
+        } else {
+            controlToAll(groupId, "leave", mapOf("member" to peerId))
+            groupNotice(groupId, "$name left")
+        }
+        if (admin != null && admin != info.adminId) {
+            groupNotice(groupId, "${memberName(admin)} is now admin")
+        }
+        refreshGroups()
+    }
+
+    /** Local wipe after leaving or being removed. */
+    private suspend fun wipeGroup(groupId: String) {
+        store.deleteGroup(groupId)
+        store.deleteConversation(groupId)
+        refreshGroups()
+    }
+
+    /** Retry a failed group message: re-fan-out to all current members. */
+    private suspend fun retryGroupMessage(groupId: String, messageId: String): Boolean {
+        val info = store.groupInfo(groupId) ?: return false
+        val self = sessions.localPeerId() ?: return false
+        val message = _messages.value.firstOrNull { it.id == messageId } ?: return false
+        if (message.deletedForEveryone) return false
+        val (sentTtl, seenTtl) = policyFor(groupId)
+        var ok = true
+        info.memberIds.filter { it != self }.forEach { member ->
+            val sealed = sealFor(member) {
+                sessions.sealGroupText(messageId, groupId, message.body, sentTtl, seenTtl)
+            }
+            if (sealed == null || !relay.sendMessage(member, sealed)) {
+                store.addGroupPending(messageId, member)
+                ok = false
+            } else {
+                store.clearGroupPending(messageId, member)
+            }
+        }
+        store.updateState(messageId, if (ok) DeliveryState.SENT else DeliveryState.FAILED)
+        return true
+    }
+
+    /**
+     * Group read receipts: one seen frame per sender. First-wins on their side
+     * keeps duplicates from extending deadlines, same as 1:1.
+     */
+    private suspend fun flushGroupSeenReceipts(groupId: String, resendAll: Boolean = false) {
+        val bySender = store.unseenGroupBySender(groupId)
+        if (bySender.isEmpty() && !resendAll) return
+        bySender.forEach { (sender, ids) -> ids.forEach { relay.sendSeen(sender, it) } }
+        store.markLocalSeen(groupId, System.currentTimeMillis())
+        reloadOpen(groupId)
+        refreshGroups()
+    }
+
+    /** Route one decrypted group text into its transcript. */
+    private suspend fun handleInboundGroupText(
+        from: String,
+        fromName: String,
+        result: dev.hush.chat.data.InboundResult.Text,
+    ) {
+        val groupId = result.groupId ?: return
+        val info = store.groupInfo(groupId)
+        if (info == null || from !in info.memberIds) return
+        // Their first group text proves they hold the group: any lingering
+        // invite entry for them is dead weight.
+        store.clearGroupPending(INVITE_PENDING_PREFIX + groupId, from)
+        val now = System.currentTimeMillis()
+        val peerName = peerNameFor(from)?.ifEmpty { null } ?: fromName.ifEmpty { "Someone" }
+        store.insertMessageIfAbsent(
+            Message(
+                id = result.msgId,
+                conversationId = groupId,
+                senderId = from,
+                senderName = peerName,
+                body = result.body,
+                sentAt = now,
+                state = DeliveryState.SENT,
+                kind = MessageKind.TEXT,
+                deletedForEveryone = false,
+                expiresAt = when {
+                    result.expSentMs != null -> now + result.expSentMs
+                    result.expSeenMs != null -> now + maxOf(result.expSeenMs, SEEN_BACKSTOP_MS)
+                    else -> 0L
+                },
+                expirySeenMs = result.expSeenMs ?: 0L,
+            )
+        )
+        if (openConversationId() == groupId) {
+            flushGroupSeenReceipts(groupId)
+        } else {
+            refreshGroups()
+        }
+    }
+
+    /** Apply one group control frame. Admin-only ops from anyone else die here. */
+    private suspend fun handleGroupControl(
+        from: String,
+        fromName: String,
+        control: dev.hush.chat.data.InboundResult.GroupControl,
+    ) {
+        val groupId = control.groupId
+        val op = control.op
+        val payload = control.payload
+        val self = sessions.localPeerId() ?: return
+        when (op) {
+            "invite" -> {
+                val name = payload.optString("name").take(SessionManager.MAX_GROUP_NAME_CHARS).ifEmpty { "Group" }
+                val admin = payload.optString("admin")
+                val created = payload.optLong("created", System.currentTimeMillis())
+                val membersJson = payload.optJSONArray("members") ?: return
+                if (admin.isEmpty() || membersJson.length() > SessionManager.MAX_GROUP_MEMBERS) return
+                val members = buildList {
+                    for (i in 0 until membersJson.length()) {
+                        val id = membersJson.optString(i)
+                        if (id.isNotEmpty()) add(id)
+                    }
+                }.distinct().take(SessionManager.MAX_GROUP_MEMBERS)
+                if (self !in members) return
+                val known = store.groupInfo(groupId) != null
+                store.upsertGroup(groupId, name, admin, created)
+                store.setGroupMembers(groupId, members, System.currentTimeMillis())
+                if (!known) {
+                    val history = payload.optJSONArray("history")
+                    if (history != null) {
+                        for (i in 0 until minOf(history.length(), SessionManager.MAX_HISTORY_ITEMS)) {
+                            val h = history.optJSONObject(i) ?: continue
+                            val hid = h.optString("id")
+                            if (hid.isEmpty()) continue
+                            val hfrom = h.optString("from")
+                            val hss = h.optLong("ss", -1L).takeIf { it in 1..SessionManager.MAX_TIMER_MS }
+                            val hsn = h.optLong("sn", -1L).takeIf { it in 1..SessionManager.MAX_TIMER_MS }
+                            val hat = System.currentTimeMillis()
+                            store.insertMessageIfAbsent(
+                                Message(
+                                    id = hid,
+                                    conversationId = groupId,
+                                    senderId = hfrom,
+                                    senderName = peerNameFor(hfrom)?.ifEmpty { null }
+                                        ?: h.optString("fromName").ifEmpty { "Someone" },
+                                    body = h.optString("body"),
+                                    sentAt = hat,
+                                    state = DeliveryState.SENT,
+                                    kind = MessageKind.TEXT,
+                                    deletedForEveryone = false,
+                                    expiresAt = when {
+                                        hss != null -> hat + hss
+                                        hsn != null -> hat + maxOf(hsn, SEEN_BACKSTOP_MS)
+                                        else -> 0L
+                                    },
+                                    expirySeenMs = hsn ?: 0L,
+                                )
+                            )
+                        }
+                    }
+                    groupNotice(groupId, "${memberName(from)} invited you to $name")
+                    emitToast("You were added to $name")
+                }
+                refreshGroups()
+            }
+            "add" -> {
+                val info = store.groupInfo(groupId) ?: return
+                if (from != info.adminId) return
+                val raw = payload.optString("members").ifEmpty { payload.optString("member") }
+                if (raw.isEmpty()) return
+                val fresh = raw.split(",").map { it.trim() }
+                    .filter { it.isNotEmpty() && it !in info.memberIds }
+                    .take((SessionManager.MAX_GROUP_MEMBERS - info.memberIds.size).coerceAtLeast(0))
+                if (fresh.isEmpty()) return
+                val now = System.currentTimeMillis()
+                fresh.forEach { store.addGroupMember(groupId, it, now) }
+                val admin = store.groupAdmin(groupId) ?: info.adminId
+                store.renameGroup(groupId, info.name, admin)
+                groupNotice(groupId, "${memberName(from)} added ${fresh.joinToString { memberName(it) }}")
+                refreshGroups()
+            }
+            "remove" -> {
+                val info = store.groupInfo(groupId) ?: return
+                if (from != info.adminId) return
+                val target = payload.optString("member")
+                if (target.isEmpty() || target !in info.memberIds) return
+                if (target == self) {
+                    wipeGroup(groupId)
+                    if (openConversationId() == groupId) _screen.value = Screen.Roster
+                    emitToast("You were removed from ${info.name}")
+                    return
+                }
+                applyMemberLeft(groupId, target, byAdmin = true)
+            }
+            "leave" -> {
+                val info = store.groupInfo(groupId) ?: return
+                val leaver = payload.optString("member").ifEmpty { from }
+                if (leaver !in info.memberIds || leaver == self) return
+                applyMemberLeft(groupId, leaver, byAdmin = false)
+            }
+            "rename" -> {
+                val info = store.groupInfo(groupId) ?: return
+                if (from != info.adminId) return
+                val clean = payload.optString("name").trim().take(SessionManager.MAX_GROUP_NAME_CHARS)
+                if (clean.isEmpty()) return
+                store.renameGroup(groupId, clean, info.adminId)
+                groupNotice(groupId, "${memberName(from)} renamed the group to $clean")
+                refreshGroups()
+                if (openConversationId() == groupId) {
+                    _screen.value = Screen.Group(groupId, clean)
+                }
+            }
         }
     }
 
@@ -1119,8 +1700,9 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
     /** Tombstone whatever expired; reload only if something actually went. */
     private suspend fun expireDue() {
         if (store.expireDue(System.currentTimeMillis()) > 0) {
-            (_screen.value as? Screen.Chat)?.let { _messages.value = store.loadMessages(it.peerId) }
+            openConversationId()?.let { _messages.value = store.loadMessages(it) }
             _peers.value = store.loadPeers()
+            refreshGroups()
         }
     }
 
@@ -1129,7 +1711,7 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
         if (msgId.isEmpty()) return
         store.markPeerSeen(msgId, System.currentTimeMillis())
         expireDue()
-        (_screen.value as? Screen.Chat)?.let { _messages.value = store.loadMessages(it.peerId) }
+        openConversationId()?.let { _messages.value = store.loadMessages(it) }
     }
 
     private suspend fun handleInboundKept(frame: JSONObject) {
@@ -1137,13 +1719,16 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
         val byName = frame.optString("byName").ifEmpty { "They" }
         val msgId = frame.optString("msgId")
         if (by.isEmpty() || msgId.isEmpty()) return
+        // Route to the right transcript: a kept group message announces in
+        // the group, a 1:1 keep in the peer chat (previous behavior).
+        val conv = store.conversationOf(msgId)?.takeIf { store.groupInfo(it) != null } ?: by
         // The sender's copy keeps its own timer — only the keeper's copy is
         // exempt. What the sender gets is the truth about it, as a system row
         // in the same transcript, not a toast that scrolls away.
         store.insertMessage(
             Message(
                 id = UUID.randomUUID().toString(),
-                conversationId = by,
+                conversationId = conv,
                 senderId = by,
                 senderName = byName,
                 body = "$byName kept a message",
@@ -1153,8 +1738,17 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
                 deletedForEveryone = false,
             )
         )
-        if ((_screen.value as? Screen.Chat)?.peerId == by) {
-            _messages.value = store.loadMessages(by)
+        reloadOpen(conv)
+    }
+
+    /** Keep a group message: exempt locally, notify the original sender. */
+    fun keepGroupMessage(messageId: String) {
+        viewModelScope.launch {
+            val message = _messages.value.firstOrNull { it.id == messageId } ?: return@launch
+            if (message.kind != MessageKind.TEXT || message.isOutgoing || message.kept) return@launch
+            store.setKept(messageId, true)
+            relay.sendKept(message.senderId, messageId)
+            reloadOpen(message.conversationId)
         }
     }
 
@@ -1172,6 +1766,10 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
 
         when (result) {
             is dev.hush.chat.data.InboundResult.Text -> {
+                if (result.groupId != null) {
+                    handleInboundGroupText(from, fromName, result)
+                    return
+                }
                 val now = System.currentTimeMillis()
                 // First arrival wins (see insertMessageIfAbsent): a redelivery
                 // must not re-stamp or move the row.
@@ -1211,6 +1809,9 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
             }
             is dev.hush.chat.data.InboundResult.ImageChunk -> {
                 handleImageChunk(from, fromName, result)
+            }
+            is dev.hush.chat.data.InboundResult.GroupControl -> {
+                handleGroupControl(from, fromName, result)
             }
             is dev.hush.chat.data.InboundResult.Signaling -> {
                 SignalingRoute.deliver(from, result.payload)
@@ -1261,20 +1862,19 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
         val msgId = frame.optString("msgId")
         if (msgId.isEmpty()) return
         store.markDeletedForEveryone(msgId)
-        // The relay forwards deletes as {by: sender, to: recipient, msgId}.
-        // The conversation to refresh is the SENDER's — `by` — because rows
-        // are stored under the peer's id on this side. The old code read `to`
-        // (our own id here) and reloaded the wrong conversation, so the bubble
-        // never visually changed even when the row was tombstoned.
-        val conv = frame.optString("by")
-            .ifEmpty { frame.optString("from") }
-            .ifEmpty { frame.optString("to") }
-        if (conv.isNotEmpty() && conv != sessions.localPeerId()) {
+        // Reload the transcript that actually holds the row. The relay
+        // forwards deletes as {by: sender, to: recipient, msgId}; for groups
+        // `by` is a member id, not the conversation — so look the row up
+        // first and fall back to the old heuristic for ancient relays.
+        val conv = store.conversationOf(msgId)
+            ?: frame.optString("by")
+                .ifEmpty { frame.optString("from") }
+                .ifEmpty { frame.optString("to") }
+                .takeIf { it.isNotEmpty() && it != sessions.localPeerId() }
+        if (conv != null) {
             _messages.value = store.loadMessages(conv)
-        } else if (conv.isNotEmpty()) {
-            // Fallback: refresh whatever chat is open if the sender field is
-            // missing (old relay builds).
-            (_screen.value as? Screen.Chat)?.let { _messages.value = store.loadMessages(it.peerId) }
+        } else {
+            openConversationId()?.let { _messages.value = store.loadMessages(it) }
         }
     }
 
@@ -1449,6 +2049,9 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
          * re-deliver — history the peer already saw.
          */
         private const val OFFLINE_DEMOTE_WINDOW_MS = 10L * 60L * 1000L
+
+        /** group_pending sentinel prefix marking an unacknowledged invite. */
+        private const val INVITE_PENDING_PREFIX = "invite:"
 
         /**
          * The public relay every install connects to by default.

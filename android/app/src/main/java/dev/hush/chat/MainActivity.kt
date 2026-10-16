@@ -28,6 +28,8 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.hush.chat.ui.ChatScreen
+import dev.hush.chat.ui.CreateGroupScreen
+import dev.hush.chat.ui.GroupInfoScreen
 import dev.hush.chat.ui.OnboardingScreen
 import dev.hush.chat.ui.RosterScreen
 import dev.hush.chat.ui.SafetyNumberScreen
@@ -56,6 +58,7 @@ class MainActivity : ComponentActivity() {
 private fun HushRoot(viewModel: HushViewModel = viewModel()) {
     val screen by viewModel.screen.collectAsStateWithLifecycle()
     val peers by viewModel.peers.collectAsStateWithLifecycle()
+    val groups by viewModel.groups.collectAsStateWithLifecycle()
     val messages by viewModel.messages.collectAsStateWithLifecycle()
     val searchHits by viewModel.searchHits.collectAsStateWithLifecycle()
     val toast by viewModel.toast.collectAsStateWithLifecycle()
@@ -126,9 +129,12 @@ private fun HushRoot(viewModel: HushViewModel = viewModel()) {
 
             is Screen.Roster -> RosterScreen(
                 peers = peers,
+                groups = groups,
                 displayName = viewModel.displayName,
                 relayState = relayState,
                 onOpenPeer = { viewModel.openChat(it.id) },
+                onOpenGroup = { viewModel.openGroup(it.id) },
+                onCreateGroup = { viewModel.navigate(Screen.NewGroup) },
                 onOpenSearch = { viewModel.navigate(Screen.Search) },
                 onOpenSettings = { viewModel.navigate(Screen.Settings) },
                 onRetryRelay = { viewModel.navigate(Screen.Roster) },
@@ -202,6 +208,68 @@ private fun HushRoot(viewModel: HushViewModel = viewModel()) {
 
             is Screen.PeerInfo -> EmptyPeerScreen(s.peerName) {
                 viewModel.navigate(Screen.Roster)
+            }
+
+            is Screen.Group -> {
+                val group = groups.firstOrNull { it.id == s.groupId }
+                var disappearing by remember(s.groupId) { mutableStateOf(viewModel.disappearingFor(s.groupId)) }
+                ChatScreen(
+                    peerName = group?.name ?: s.groupName,
+                    peerSeed = s.groupId.fold(0) { acc, c -> (acc * 31 + c.code) and 0x7FFFFFFF },
+                    peerVerified = false,
+                    messages = messages,
+                    peerTyping = false,
+                    disappearingValue = disappearing,
+                    disappearingLabel = viewModel.disappearingLabel(disappearing),
+                    onSetDisappearing = {
+                        viewModel.setDisappearing(s.groupId, it)
+                        disappearing = it
+                    },
+                    onBack = { viewModel.navigate(Screen.Roster) },
+                    onSend = { viewModel.sendGroupText(s.groupId, it) },
+                    onTyping = {},
+                    onDelete = { viewModel.deleteGroupMessageForEveryone(s.groupId, it.id) },
+                    onKeep = { viewModel.keepGroupMessage(it.id) },
+                    onSendImage = {},
+                    onRetry = { viewModel.retryMessage(s.groupId, it.id) },
+                    onVoiceCall = {},
+                    onVideoCall = {},
+                    onVerify = {},
+                    isGroup = true,
+                    groupSubtitle = group?.let { "${it.memberIds.size} members" },
+                    showSenderNames = true,
+                    onOpenGroupInfo = { viewModel.navigate(Screen.GroupDetail(s.groupId)) },
+                    callsEnabled = false,
+                    imagesEnabled = false,
+                )
+            }
+
+            is Screen.NewGroup -> CreateGroupScreen(
+                peers = peers,
+                onBack = { viewModel.navigate(Screen.Roster) },
+                onCreate = { name, members ->
+                    viewModel.createGroup(name, members)
+                },
+            )
+
+            is Screen.GroupDetail -> {
+                val group = groups.firstOrNull { it.id == s.groupId }
+                if (group == null) {
+                    LaunchedEffect(Unit) { viewModel.navigate(Screen.Roster) }
+                } else {
+                    GroupInfoScreen(
+                        group = group,
+                        peers = peers,
+                        selfId = viewModel.selfId,
+                        onBack = { viewModel.openGroup(s.groupId) },
+                        onAddMembers = { viewModel.addGroupMembers(s.groupId, it) },
+                        onRemoveMember = { viewModel.removeGroupMember(s.groupId, it) },
+                        onRename = { viewModel.renameGroup(s.groupId, it) },
+                        onLeave = {
+                            viewModel.leaveGroup(s.groupId)
+                        },
+                    )
+                }
             }
         }
         }

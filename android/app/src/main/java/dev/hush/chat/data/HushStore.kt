@@ -120,6 +120,46 @@ class HushStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
             END
             """.trimIndent()
         )
+
+        createGroupTables(db)
+    }
+
+    private fun createGroupTables(db: SQLiteDatabase) {
+        // Private groups are purely client-side: the relay never learns they
+        // exist. Membership lives here; every coordination frame rides a 1:1
+        // E2E channel, so a non-member's database has no trace of the group.
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS groups (
+                id           TEXT PRIMARY KEY,
+                name         TEXT NOT NULL DEFAULT '',
+                admin_id     TEXT NOT NULL DEFAULT '',
+                created_at   INTEGER NOT NULL DEFAULT 0,
+                deleted      INTEGER NOT NULL DEFAULT 0
+            )
+            """.trimIndent()
+        )
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS group_members (
+                group_id   TEXT NOT NULL,
+                peer_id    TEXT NOT NULL,
+                joined_at  INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (group_id, peer_id)
+            )
+            """.trimIndent()
+        )
+        // Per-member offline queue: the relay stores nothing, so a group text
+        // sent while a member is gone must be re-fanned to exactly them later.
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS group_pending (
+                message_id TEXT NOT NULL,
+                member_id  TEXT NOT NULL,
+                PRIMARY KEY (message_id, member_id)
+            )
+            """.trimIndent()
+        )
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -144,6 +184,10 @@ class HushStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
             // rows keep expired = 0 and render as deleted — factually fine,
             // they were removed either way.
             runCatching { db.execSQL("ALTER TABLE messages ADD COLUMN expired INTEGER NOT NULL DEFAULT 0") }
+        }
+        if (oldVersion < 4) {
+            // Private groups: brand-new tables, no migration of old rows.
+            runCatching { createGroupTables(db) }
         }
     }
 
@@ -569,14 +613,12 @@ class HushStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
     // -------------------------------------------------------------------------
 
     /**
-     * Unsent outgoing messages for one conversation, oldest first.
+     * Unsent outgoing 1:1 messages for one conversation, oldest first.
      *
-     * These are the rows a send attempt left behind as PENDING or FAILED —
-     * the peer was offline, we were offline, or the bundle had not arrived
-     * yet. They are the offline queue: the relay stores nothing for absent
-     * peers, so the sender's device holds them and flushes them when the peer
-     * reappears. Tombstoned rows are excluded — a message whose own timer
-     * expired before delivery must never be delivered late.
+     * Group transcripts are excluded here: their rows fan out per member
+     * through [pendingGroupForMember], and must never go out as a 1:1 text
+     * addressed to the group id. Tombstoned rows are excluded — a message
+     * whose own timer expired before delivery must never be delivered late.
      */
     suspend fun pendingOutgoing(conversationId: String, limit: Int = 100): List<OutboxItem> =
         withContext(Dispatchers.IO) {
@@ -660,6 +702,300 @@ class HushStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
             )
         }
     }
+
+    // -------------------------------------------------------------------------
+    // Private groups
+    // -------------------------------------------------------------------------
+
+    /** Create or update a group row. Members are managed separately. */
+    suspend fun upsertGroup(id: String, name: String, adminId: String, createdAt: Long) =
+        withContext(Dispatchers.IO) {
+            ioLock.write {
+                writableDatabase.execSQL(
+                    "INSERT INTO groups (id, name, admin_id, created_at, deleted) VALUES (?, ?, ?, ?, 0) " +
+                        "ON CONFLICT(id) DO UPDATE SET name = excluded.name, admin_id = excluded.admin_id",
+                    arrayOf<Any>(id, name, adminId, createdAt),
+                )
+            }
+        }
+
+    /** Replace the full member list (invite path carries the whole roster). */
+    suspend fun setGroupMembers(groupId: String, memberIds: List<String>, joinedAt: Long) =
+        withContext(Dispatchers.IO) {
+            ioLock.write {
+                val db = writableDatabase
+                db.beginTransaction()
+                try {
+                    db.execSQL("DELETE FROM group_members WHERE group_id = ?", arrayOf<Any>(groupId))
+                    memberIds.distinct().forEach { member ->
+                        db.execSQL(
+                            "INSERT INTO group_members (group_id, peer_id, joined_at) VALUES (?, ?, ?)",
+                            arrayOf<Any>(groupId, member, joinedAt),
+                        )
+                    }
+                    db.setTransactionSuccessful()
+                } finally {
+                    db.endTransaction()
+                }
+            }
+        }
+
+    suspend fun addGroupMember(groupId: String, peerId: String, joinedAt: Long) =
+        withContext(Dispatchers.IO) {
+            ioLock.write {
+                writableDatabase.execSQL(
+                    "INSERT OR IGNORE INTO group_members (group_id, peer_id, joined_at) VALUES (?, ?, ?)",
+                    arrayOf<Any>(groupId, peerId, joinedAt),
+                )
+            }
+        }
+
+    suspend fun removeGroupMember(groupId: String, peerId: String) = withContext(Dispatchers.IO) {
+        ioLock.write {
+            val db = writableDatabase
+            db.execSQL(
+                "DELETE FROM group_members WHERE group_id = ? AND peer_id = ?",
+                arrayOf<Any>(groupId, peerId),
+            )
+            db.execSQL(
+                "DELETE FROM group_pending WHERE member_id = ? AND message_id IN " +
+                    "(SELECT id FROM messages WHERE conversation_id = ?)",
+                arrayOf<Any>(peerId, groupId),
+            )
+        }
+    }
+
+    /** Wipe a group: row flagged, members and pending queue dropped. */
+    suspend fun deleteGroup(groupId: String) = withContext(Dispatchers.IO) {
+        ioLock.write {
+            val db = writableDatabase
+            db.beginTransaction()
+            try {
+                db.execSQL("UPDATE groups SET deleted = 1 WHERE id = ?", arrayOf<Any>(groupId))
+                db.execSQL("DELETE FROM group_members WHERE group_id = ?", arrayOf<Any>(groupId))
+                db.execSQL(
+                    "DELETE FROM group_pending WHERE message_id IN " +
+                        "(SELECT id FROM messages WHERE conversation_id = ?)",
+                    arrayOf<Any>(groupId),
+                )
+                db.setTransactionSuccessful()
+            } finally {
+                db.endTransaction()
+            }
+        }
+    }
+
+    /** Rename a group and record the current deterministic admin. */
+    suspend fun renameGroup(groupId: String, name: String, adminId: String) =
+        withContext(Dispatchers.IO) {
+            ioLock.write {
+                writableDatabase.execSQL(
+                    "UPDATE groups SET name = ?, admin_id = ? WHERE id = ?",
+                    arrayOf<Any>(name, adminId, groupId),
+                )
+            }
+        }
+
+    /** Delete every message row of a conversation (wipe path; FTS follows). */
+    suspend fun deleteConversation(conversationId: String) = withContext(Dispatchers.IO) {
+        ioLock.write {
+            writableDatabase.execSQL(
+                "DELETE FROM messages WHERE conversation_id = ?",
+                arrayOf<Any>(conversationId),
+            )
+        }
+    }
+
+    /** Which conversation holds a message id, or null. */
+    suspend fun conversationOf(messageId: String): String? = withContext(Dispatchers.IO) {
+        ioLock.read {
+            readableDatabase.rawQuery(
+                "SELECT conversation_id FROM messages WHERE id = ? LIMIT 1",
+                arrayOf(messageId),
+            ).use { c -> if (c.moveToFirst()) c.getString(0) else null }
+        }
+    }
+
+    /**
+     * Recent own group sends involving one member: the rows an async
+     * unknown_peer error must re-queue for them. Group analogue of the 1:1
+     * demote — same window discipline, so a late error cannot resurrect old
+     * history either.
+     */
+    suspend fun recentGroupSendsForMember(memberId: String, sinceMs: Long): List<Pair<String, String>> =
+        withContext(Dispatchers.IO) {
+            ioLock.read {
+                readableDatabase.rawQuery(
+                    """
+                    SELECT m.conversation_id, m.id FROM messages m
+                    JOIN group_members gm ON gm.group_id = m.conversation_id
+                    WHERE gm.peer_id = ? AND m.sender_id = ?
+                      AND m.deleted = 0 AND m.state = ? AND m.sent_at >= ?
+                    """.trimIndent(),
+                    arrayOf(
+                        memberId,
+                        Message.LOCAL_SENTINEL,
+                        DeliveryState.SENT.ordinal.toString(),
+                        sinceMs.toString(),
+                    ),
+                ).use { c ->
+                    buildList { while (c.moveToNext()) add(c.getString(0) to c.getString(1)) }
+                }
+            }
+        }
+
+    /** One group with its member ids, or null when unknown/wiped. */
+    suspend fun groupInfo(groupId: String): GroupInfo? = withContext(Dispatchers.IO) {
+        ioLock.read {
+            val db = readableDatabase
+            val meta = db.rawQuery(
+                "SELECT id, name, admin_id, created_at FROM groups WHERE id = ? AND deleted = 0",
+                arrayOf(groupId),
+            ).use { c -> if (c.moveToFirst()) c.getString(0) to Triple(c.getString(1), c.getString(2), c.getLong(3)) else null }
+                ?: return@read null
+            val members = db.rawQuery(
+                "SELECT peer_id FROM group_members WHERE group_id = ? ORDER BY joined_at ASC, peer_id ASC",
+                arrayOf(groupId),
+            ).use { c -> buildList { while (c.moveToNext()) add(c.getString(0)) } }
+            val unread = db.rawQuery(
+                "SELECT COUNT(*) FROM messages WHERE conversation_id = ? AND sender_id != ? " +
+                    "AND deleted = 0 AND state != ?",
+                arrayOf(groupId, Message.LOCAL_SENTINEL, DeliveryState.FAILED.ordinal.toString()),
+            ).use { c -> if (c.moveToFirst()) c.getInt(0) else 0 }
+            GroupInfo(meta.first, meta.second.first, meta.second.second, meta.second.third, members, unread)
+        }
+    }
+
+    /** All live groups, newest first. */
+    suspend fun listGroups(): List<GroupInfo> = withContext(Dispatchers.IO) {
+        ioLock.read {
+            readableDatabase.rawQuery(
+                "SELECT id FROM groups WHERE deleted = 0 ORDER BY created_at DESC",
+                emptyArray(),
+            ).use { c -> buildList { while (c.moveToNext()) add(c.getString(0)) } }
+        }.mapNotNull { groupInfo(it) }
+    }
+
+    /**
+     * Deterministic admin: earliest join wins, lowest peer id breaks ties.
+     * Every member computes the same answer from the same member table, so
+     * admin succession needs no consensus — including after the admin leaves.
+     */
+    suspend fun groupAdmin(groupId: String): String? = withContext(Dispatchers.IO) {
+        ioLock.read {
+            readableDatabase.rawQuery(
+                "SELECT peer_id FROM group_members WHERE group_id = ? ORDER BY joined_at ASC, peer_id ASC LIMIT 1",
+                arrayOf(groupId),
+            ).use { c -> if (c.moveToFirst()) c.getString(0) else null }
+        }
+    }
+
+    /** Queue one group message for one member's return. Idempotent. */
+    suspend fun addGroupPending(messageId: String, memberId: String) = withContext(Dispatchers.IO) {
+        ioLock.write {
+            writableDatabase.execSQL(
+                "INSERT OR IGNORE INTO group_pending (message_id, member_id) VALUES (?, ?)",
+                arrayOf<Any>(messageId, memberId),
+            )
+        }
+    }
+
+    suspend fun clearGroupPending(messageId: String, memberId: String) = withContext(Dispatchers.IO) {
+        ioLock.write {
+            writableDatabase.execSQL(
+                "DELETE FROM group_pending WHERE message_id = ? AND member_id = ?",
+                arrayOf<Any>(messageId, memberId),
+            )
+        }
+    }
+
+    /** Group texts still owed to one member, oldest first with bodies. */
+    suspend fun pendingGroupForMember(memberId: String, limit: Int = 100): List<Pair<String, OutboxItem>> =
+        withContext(Dispatchers.IO) {
+            ioLock.read {
+                readableDatabase.rawQuery(
+                    """
+                    SELECT m.conversation_id, m.id, m.body FROM group_pending gp
+                    JOIN messages m ON m.id = gp.message_id
+                    WHERE gp.member_id = ? AND m.deleted = 0
+                    ORDER BY m.sent_at ASC, m.rowid ASC
+                    LIMIT ?
+                    """.trimIndent(),
+                    arrayOf(memberId, limit.toString()),
+                ).use { c ->
+                    buildList {
+                        while (c.moveToNext()) add(
+                            c.getString(0) to OutboxItem(id = c.getString(1), body = c.getString(2) ?: ""),
+                        )
+                    }
+                }
+            }
+        }
+
+    /** Unseen inbound ids per sender — group read receipts go to each sender. */
+    suspend fun unseenGroupBySender(conversationId: String, limit: Int = 200): Map<String, List<String>> =
+        withContext(Dispatchers.IO) {
+            ioLock.read {
+                readableDatabase.rawQuery(
+                    """
+                    SELECT sender_id, id FROM messages
+                    WHERE conversation_id = ? AND sender_id != ?
+                      AND deleted = 0 AND seen_at = 0
+                    ORDER BY sent_at ASC, rowid ASC
+                    LIMIT ?
+                    """.trimIndent(),
+                    arrayOf(conversationId, Message.LOCAL_SENTINEL, limit.toString()),
+                ).use { c ->
+                    buildMap<String, MutableList<String>> {
+                        while (c.moveToNext()) {
+                            getOrPut(c.getString(0)) { mutableListOf() }.add(c.getString(1))
+                        }
+                    }
+                }
+            }
+        }
+
+    /** Last N non-deleted texts of a conversation, oldest first (join history). */
+    suspend fun lastTexts(conversationId: String, limit: Int): List<Message> =
+        withContext(Dispatchers.IO) {
+            ioLock.read {
+                readableDatabase.rawQuery(
+                    """
+                    SELECT id, conversation_id, sender_id, sender_name, body, sent_at, state, kind, deleted, attachment,
+                           seen_at, expires_at, exp_seen_ms, kept, expired
+                    FROM messages
+                    WHERE conversation_id = ? AND deleted = 0 AND kind = ?
+                    ORDER BY sent_at DESC, rowid DESC
+                    LIMIT ?
+                    """.trimIndent(),
+                    arrayOf(conversationId, MessageKind.TEXT.ordinal.toString(), limit.toString()),
+                ).use { c ->
+                    buildList {
+                        while (c.moveToNext()) {
+                            add(
+                                Message(
+                                    id = c.getString(0),
+                                    conversationId = c.getString(1),
+                                    senderId = c.getString(2),
+                                    senderName = c.getString(3) ?: "",
+                                    body = c.getString(4) ?: "",
+                                    sentAt = c.getLong(5),
+                                    state = DeliveryState.entries.getOrElse(c.getInt(6)) { DeliveryState.SENT },
+                                    kind = MessageKind.TEXT,
+                                    deletedForEveryone = c.getInt(8) == 1,
+                                    attachmentLabel = c.getString(9),
+                                    seenAt = c.getLong(10),
+                                    expiresAt = c.getLong(11),
+                                    expirySeenMs = c.getLong(12),
+                                    kept = c.getInt(13) == 1,
+                                    expired = c.getInt(14) == 1,
+                                )
+                            )
+                        }
+                    }.reversed()
+                }
+            }
+        }
     /**
      * Locally-seen inbound timer messages for receipt re-sends.
      * @param sinceMs only rows seen at or after this time; 0 means all.
@@ -755,6 +1091,6 @@ class HushStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
 
     companion object {
         const val DB_NAME = "hush.db"
-        const val DB_VERSION = 3
+        const val DB_VERSION = 4
     }
 }

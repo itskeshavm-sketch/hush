@@ -34,13 +34,16 @@ export const MAX_ROSTER = 5000;
 // Client -> Server
 // ---------------------------------------------------------------------------
 
-/** @typedef {'hello'|'roster'|'send'|'delete'|'typing'|'rtc'|'profile'|'ping'} ClientFrame */
+/** @typedef {'hello'|'roster'|'send'|'delete'|'seen'|'kept'|'reset'|'typing'|'rtc'|'profile'|'ping'} ClientFrame */
 
 export const CLIENT_FRAMES = Object.freeze([
   'hello',
   'roster',
   'send',
   'delete',
+  'seen',
+  'kept',
+  'reset',
   'typing',
   'rtc',
   'profile',
@@ -54,7 +57,7 @@ export const PRE_HELLO_FRAMES = Object.freeze(['hello', 'ping']);
 // Server -> Client
 // ---------------------------------------------------------------------------
 
-/** @typedef {'welcome'|'roster'|'presence'|'msg'|'delete'|'typing'|'rtc'|'error'|'pong'} ServerFrame */
+/** @typedef {'welcome'|'roster'|'presence'|'msg'|'delete'|'seen'|'kept'|'reset'|'typing'|'rtc'|'error'|'pong'} ServerFrame */
 
 export const SERVER_FRAMES = Object.freeze([
   'welcome',
@@ -62,6 +65,9 @@ export const SERVER_FRAMES = Object.freeze([
   'presence',
   'msg',
   'delete',
+  'seen',
+  'kept',
+  'reset',
   'typing',
   'rtc',
   'error',
@@ -123,6 +129,11 @@ export function parseInbound(raw, ctx) {
       return validateSend(msg, ctx);
     case 'delete':
       return validateDelete(msg, ctx);
+    case 'seen':
+    case 'kept':
+      return validateReceipt(msg, ctx);
+    case 'reset':
+      return validateReset(msg, ctx);
     case 'typing':
       return validateTyping(msg, ctx);
     case 'profile':
@@ -256,8 +267,51 @@ function validateDelete(msg, ctx) {
   };
 }
 
-function validateTyping(msg, ctx) {
-  if (typeof msg.to !== 'string' || msg.to.length === 0 || msg.to.length > 64) {
+/**
+ * Read receipts and keep notices.
+ *
+ * Same shape as a delete minus the blast radius: a peer id plus a message
+ * id. Fire-and-forget like typing, not error-checked like delete — a receipt
+ * for an offline peer is simply dropped, and the sender re-sends receipts
+ * when the peer reappears. Erroring would just be noise the client cannot
+ * act on without a correlation id, which would itself be more metadata.
+ */
+function validateReceipt(msg, ctx) {
+  if (typeof msg.msgId !== 'string' || msg.msgId.length === 0 || msg.msgId.length > 64) {
+    return fail(ERROR_CODES.BAD_FRAME, 'msgId required');
+  }
+  const to = msg.to;
+  if (typeof to !== 'string' || to.length === 0 || to.length > 64) {
+    return fail(ERROR_CODES.BAD_FRAME, 'to must be a peer id');
+  }
+  if (to === ctx.selfId) {
+    return fail(ERROR_CODES.SELF_TARGET, 'cannot address yourself');
+  }
+  return { ok: true, frame: { t: msg.t, to, msgId: msg.msgId } };
+}
+
+/**
+ * Session reset request: "drop your ratchet for me, our keys desynchronised".
+ *
+ * The failure it heals: the sender keeps encrypting on a stale session while
+ * the recipient fails every message — the sender never learns, so every
+ * message fails forever. Fire-and-forget like typing: no error when the peer
+ * is offline (erroring would surface raw peer ids as toasts for a routine
+ * retryable event), and the sender re-establishes via X3DH on the next
+ * message either way.
+ */
+function validateReset(msg, ctx) {
+  const to = msg.to;
+  if (typeof to !== 'string' || to.length === 0 || to.length > 64) {
+    return fail(ERROR_CODES.BAD_FRAME, 'to must be a peer id');
+  }
+  if (to === ctx.selfId) {
+    return fail(ERROR_CODES.SELF_TARGET, 'cannot address yourself');
+  }
+  return { ok: true, frame: { t: 'reset', to } };
+}
+
+function validateTyping(msg, ctx) {  if (typeof msg.to !== 'string' || msg.to.length === 0 || msg.to.length > 64) {
     return fail(ERROR_CODES.BAD_FRAME, 'to must be a peer id');
   }
   return { ok: true, frame: { t: 'typing', to: msg.to, state: msg.state === true } };

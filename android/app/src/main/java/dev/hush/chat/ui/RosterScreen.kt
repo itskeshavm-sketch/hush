@@ -1,6 +1,5 @@
 package dev.hush.chat.ui
 
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -44,7 +43,6 @@ import dev.hush.chat.net.RelayState
 import dev.hush.chat.ui.components.ConnectionBanner
 import dev.hush.chat.ui.components.EmptyState
 import dev.hush.chat.ui.components.InitialsAvatar
-import dev.hush.chat.ui.components.SectionHeader
 import dev.hush.chat.ui.theme.HushAccent
 import dev.hush.chat.ui.theme.HushDanger
 import dev.hush.chat.ui.theme.HushTextSecondary
@@ -72,8 +70,11 @@ fun RosterScreen(
     onRetryRelay: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val online = peers.filter { it.online }
-    val offline = peers.filter { !it.online }
+    // No online/offline sections: presence was never accurate enough to show
+    // (stale "online" for gone peers), so the list no longer claims it. The
+    // app still tracks reachability internally to flush the offline outbox —
+    // it just stopped printing guesses. Alphabetical, stable.
+    val sorted = peers.sortedBy { it.displayName.lowercase() }
     val totalUnread = peers.sumOf { it.unreadCount }
 
     Scaffold(
@@ -143,20 +144,10 @@ fun RosterScreen(
                 modifier = Modifier.fillMaxSize(),
                 contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 24.dp),
             ) {
-                if (online.isNotEmpty()) {
-                    item { SectionHeader("Online — ${online.size}") }
-                    items(online, key = { it.id }) { peer ->
-                        PeerRow(peer, onClick = { onOpenPeer(peer) })
-                    }
+                items(sorted, key = { it.id }) { peer ->
+                    PeerRow(peer, onClick = { onOpenPeer(peer) })
                 }
-                if (offline.isNotEmpty()) {
-                    item { SectionHeader("Offline — ${offline.size}") }
-                    items(offline, key = { it.id }) { peer ->
-                        PeerRow(peer, onClick = { onOpenPeer(peer) })
-                    }
-                }
-            }
-        }
+            }        }
     }
 }
 
@@ -173,7 +164,7 @@ private fun PeerRow(peer: Peer, onClick: () -> Unit) {
             initials = peer.initials,
             seed = peer.avatarSeed(),
             size = 46.dp,
-            online = peer.online,
+            online = null,
             verified = peer.verified,
         )
 
@@ -197,11 +188,7 @@ private fun PeerRow(peer: Peer, onClick: () -> Unit) {
                 }
             }
             Text(
-                text = when {
-                    peer.unreadCount > 0 -> "${peer.unreadCount} unread"
-                    peer.online -> "tap to open a conversation"
-                    else -> "last seen ${relativeTime(peer.lastSeen)}"
-                },
+                text = if (peer.unreadCount > 0) "${peer.unreadCount} unread" else "tap to open a conversation",
                 style = MaterialTheme.typography.bodySmall,
                 color = HushTextSecondary,
             )

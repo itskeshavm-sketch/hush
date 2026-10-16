@@ -54,7 +54,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.hush.chat.R
 import dev.hush.chat.ui.components.clickableNoRipple
-import dev.hush.chat.ui.components.clickableNoRipple
 import dev.hush.chat.ui.theme.HushAccent
 import dev.hush.chat.ui.theme.HushOnline
 import dev.hush.chat.ui.theme.HushSurfaceElevated

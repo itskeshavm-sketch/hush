@@ -59,6 +59,23 @@ export default {
       return stub.fetch("https://internal/health");
     }
 
+    // Operator-only: drop every socket and erase every peer record, so the
+    // roster empties globally. Gated by a bearer secret held as a wrangler
+    // encrypted env var (never in the repo) — and a wrong/missing key gets a
+    // bare 404, so the endpoint does not advertise itself to scanners.
+    if (url.pathname === "/admin/evict") {
+      if (request.method !== "POST") {
+        return new Response("not found", { status: 404 });
+      }
+      const want = env.ADMIN_KEY;
+      const got = request.headers.get("authorization");
+      if (typeof want !== "string" || want.length < 16 || got !== `Bearer ${want}`) {
+        return new Response("not found", { status: 404 });
+      }
+      const stub = env.HUB.get(env.HUB.idFromName("global"));
+      return stub.fetch("https://internal/admin/evict", { method: "POST" });
+    }
+
     if (url.pathname === "/ws") {
       if (request.headers.get("Upgrade") !== "websocket") {
         return new Response("expected a websocket upgrade", { status: 400 });
@@ -122,6 +139,28 @@ export class HushRelay extends DurableObject {
         names: roster.map((p) => p.name),
         note: "zero-retention relay — no message content, no history, no accounts",
       });
+    }
+
+    // Reached only via the Worker's authed /admin/evict route — the DO itself
+    // is never directly addressable, so no second auth check here.
+    if (url.pathname === "/admin/evict" && request.method === "POST") {
+      const live = this.ctx.getWebSockets();
+      for (const ws of live) {
+        try {
+          ws.close(4001, "relay cleared by operator");
+        } catch {
+          /* already gone */
+        }
+      }
+      // Belt and braces: sockets closing will also trigger per-socket
+      // cleanup, but records are deleted here so a missed close event can
+      // never leave a ghost row behind.
+      const stored = await this.state.storage.list({ prefix: PEER_KEY });
+      for (const key of stored.keys()) {
+        await this.state.storage.delete(key);
+      }
+      this.presenceQueued = false;
+      return json({ evicted: live.length, cleared: stored.size });
     }
 
     if (request.headers.get("Upgrade") !== "websocket") {
@@ -265,6 +304,42 @@ export class HushRelay extends DurableObject {
           to: frame.to,
           msgId: frame.msgId,
           forAll: frame.forAll,
+          at: Date.now(),
+        });
+        return;
+      }
+
+      case "seen":
+      case "kept": {
+        if (!peer) return;
+        const target = this.#socketFor(frame.to);
+        // Receipts are fire-and-forget like typing: a receipt for an offline
+        // peer is dropped, and the sender's client re-sends unacked receipts
+        // when the peer reappears. Silence is correct.
+        if (!target) return;
+        this.#send(target, {
+          t: frame.t,
+          by: peer.id,
+          byName: peer.name,
+          to: frame.to,
+          msgId: frame.msgId,
+          at: Date.now(),
+        });
+        return;
+      }
+
+      case "reset": {
+        if (!peer) return;
+        const target = this.#socketFor(frame.to);
+        // Fire-and-forget like typing: erroring for an offline peer would
+        // surface raw peer ids for a routine event, and the next message
+        // re-establishes the session regardless.
+        if (!target) return;
+        this.#send(target, {
+          t: "reset",
+          by: peer.id,
+          byName: peer.name,
+          to: frame.to,
           at: Date.now(),
         });
         return;

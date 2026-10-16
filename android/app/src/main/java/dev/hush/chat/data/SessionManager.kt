@@ -31,11 +31,46 @@ sealed interface InboundResult {
      * for-everyone can never match the recipient's row against the sender's
      * delete frame. That was exactly the old bug: both sides minted their own
      * UUIDs, so a delete by the sender's id matched nothing on receipt.
+     *
+     * [expSentMs] / [expSeenMs] are the sender's disappearing timers for this
+     * message, also inside the ciphertext: the receiver enforces the sender's
+     * policy, so both sides agree without an extra handshake. Null means no
+     * timer of that kind.
      */
-    data class Text(val conversationId: String, val from: String, val fromName: String, val body: String, val at: Long, val msgId: String) : InboundResult
+    data class Text(
+        val conversationId: String,
+        val from: String,
+        val fromName: String,
+        val body: String,
+        val at: Long,
+        val msgId: String,
+        val expSentMs: Long? = null,
+        val expSeenMs: Long? = null,
+    ) : InboundResult
 
     /** WebRTC signaling for an active call. */
     data class Signaling(val conversationId: String, val from: String, val payload: String) : InboundResult
+
+    /**
+     * One chunk of an image message.
+     *
+     * Images ride the same E2E ratchet as text, but the relay caps a frame at
+     * 64 KiB — so a photo travels as numbered chunks sharing the sender's
+     * message id. Every chunk carries the caption and timers, so any single
+     * chunk describes the whole message and reassembly needs no side channel.
+     * [data] is raw JPEG bytes (already base64-decoded from the payload).
+     */
+    data class ImageChunk(
+        val conversationId: String,
+        val from: String,
+        val msgId: String,
+        val caption: String,
+        val index: Int,
+        val total: Int,
+        val data: ByteArray,
+        val expSentMs: Long?,
+        val expSeenMs: Long?,
+    ) : InboundResult
 
     /** Nothing to do — duplicate, system noise, or a non-text message kind. */
     data object Ignored : InboundResult
@@ -423,17 +458,61 @@ class SessionManager(private val context: Context) {
         if (kind == "rtc") {
             return InboundResult.Signaling(peerId, peerId, plaintext)
         }
-        // Payload format v1: {"v":1,"id":"<sender uuid>","body":"..."}.
-        // Older builds sent raw text with no id; those get a fresh random id
-        // so they still display, but they can never be deleted for everyone —
-        // there is no shared id to address. Both sides on the current build
-        // always send v1, so this fallback only triggers against history.
+        // Payload format v2: {"v":2,"id":"<sender uuid>","body":"...",
+        // "ss":<after-sent ms>,"sn":<after-seen ms>}. v1 (no timers) is
+        // accepted the same way. Older builds sent raw text with no id; those
+        // get a fresh random id so they still display, but they can never be
+        // deleted for everyone — there is no shared id to address.
+        //
+        // Timer bounds are enforced, not trusted: a malicious peer could
+        // otherwise set a one-millisecond timer (instant wipe, annoying) or a
+        // century (never expires, harmless but wrong). Out-of-range values are
+        // dropped to "no timer" rather than rejecting the message, because a
+        // bad timer must never cost the text.
         val parsed = runCatching { org.json.JSONObject(plaintext) }.getOrNull()
-        if (parsed != null && parsed.optInt("v", 0) == 1) {
-            val id = parsed.optString("id")
-            val body = parsed.optString("body")
-            if (id.isNotEmpty()) {
-                return InboundResult.Text(peerId, peerId, "", body, System.currentTimeMillis(), id)
+        if (parsed != null) {
+            val version = parsed.optInt("v", 0)
+            if (version == 1 || version == 2) {
+                val id = parsed.optString("id")
+                val body = parsed.optString("body")
+                if (id.isNotEmpty()) {
+                    return InboundResult.Text(
+                        peerId, peerId, "", body, System.currentTimeMillis(), id,
+                        expSentMs = parsed.optLong("ss", -1L).takeIf { it in 1..MAX_TIMER_MS },
+                        expSeenMs = parsed.optLong("sn", -1L).takeIf { it in 1..MAX_TIMER_MS },
+                    )
+                }
+            }
+            if (version == 3) {
+                // Image chunk. Bounds enforced before anything is allocated:
+                // a malicious peer announcing total = 1_000_000 must not get
+                // a million-slot array, and an index outside the range must
+                // not write anywhere.
+                val id = parsed.optString("id")
+                val total = parsed.optInt("n", 0)
+                val index = parsed.optInt("ch", -1)
+                val dataB64 = parsed.optString("data")
+                if (id.isNotEmpty() && total in 1..MAX_IMAGE_CHUNKS && index in 0 until total &&
+                    dataB64.length in 1..MAX_CHUNK_B64
+                ) {
+                    val data = runCatching {
+                        java.util.Base64.getDecoder().decode(dataB64)
+                    }.getOrNull()
+                    if (data != null && data.size in 1..MAX_CHUNK_RAW) {
+                        return InboundResult.ImageChunk(
+                            peerId, peerId, id,
+                            caption = parsed.optString("body"),
+                            index = index,
+                            total = total,
+                            data = data,
+                            expSentMs = parsed.optLong("ss", -1L).takeIf { it in 1..MAX_TIMER_MS },
+                            expSeenMs = parsed.optLong("sn", -1L).takeIf { it in 1..MAX_TIMER_MS },
+                        )
+                    }
+                }
+                // A malformed chunk is a failed image, never a crash and never
+                // a row: without all chunks in range there is nothing to show.
+                return InboundResult.Ignored
             }
         }
         return InboundResult.Text(
@@ -447,10 +526,38 @@ class SessionManager(private val context: Context) {
      *
      * The id travels inside the ciphertext so the recipient stores the same row
      * id the sender holds. Delete-for-everyone is addressed by that id; without
-     * it the two sides disagree and deletes silently match nothing.
+     * it the two sides disagree and deletes silently match nothing. The timers
+     * travel the same way, so the receiver enforces the sender's policy with no
+     * extra handshake — and the relay never sees any of it.
      */
-    fun sealText(id: String, body: String): ByteArray =
-        org.json.JSONObject().put("v", 1).put("id", id).put("body", body).toString().toByteArray()
+    fun sealText(id: String, body: String, expSentMs: Long?, expSeenMs: Long?): ByteArray {
+        val o = org.json.JSONObject().put("v", 2).put("id", id).put("body", body)
+        if (expSentMs != null && expSentMs in 1..MAX_TIMER_MS) o.put("ss", expSentMs)
+        if (expSeenMs != null && expSeenMs in 1..MAX_TIMER_MS) o.put("sn", expSeenMs)
+        return o.toString().toByteArray()
+    }
+
+    /**
+     * Seal one image chunk. Same id/caption/timers on every chunk of the
+     * message, so each chunk is self-describing and reassembly is just
+     * concatenation in index order.
+     */
+    fun sealImageChunk(
+        id: String,
+        caption: String,
+        index: Int,
+        total: Int,
+        dataB64: String,
+        expSentMs: Long?,
+        expSeenMs: Long?,
+    ): ByteArray {
+        val o = org.json.JSONObject()
+            .put("v", 3).put("id", id).put("body", caption)
+            .put("ch", index).put("n", total).put("data", dataB64)
+        if (expSentMs != null && expSentMs in 1..MAX_TIMER_MS) o.put("ss", expSentMs)
+        if (expSeenMs != null && expSeenMs in 1..MAX_TIMER_MS) o.put("sn", expSeenMs)
+        return o.toString().toByteArray()
+    }
 
     // -------------------------------------------------------------------------
     // Safety numbers
@@ -551,6 +658,20 @@ class SessionManager(private val context: Context) {
         private const val KEY_LOCAL_PREKEY = "local_prekey_private"
         private const val KEY_LOCAL_SIGNED = "local_signed_prekey_private"
         private const val KEY_LOCAL_COUNTER = "local_prekey_counter"
+
+        /** Largest timer the payload will carry: one year. See [interpret]. */
+        const val MAX_TIMER_MS = 365L * 24L * 60L * 60L * 1000L
+
+        /**
+         * Image chunk bounds. A chunk's base64 must decode to at most 36 KiB,
+         * so the sealed frame stays comfortably under the relay's 64 KiB
+         * envelope cap after JSON + ratchet overhead + envelope base64.
+         * At most 80 chunks ≈ 2.8 MB per image; anything bigger is refused
+         * before a single frame is sent.
+         */
+        const val MAX_CHUNK_RAW = 36 * 1024
+        const val MAX_CHUNK_B64 = 64 * 1024
+        const val MAX_IMAGE_CHUNKS = 80
 
         @JvmStatic
         val AAD_V1: ByteArray = "HUSH/msg/v1".toByteArray()

@@ -142,6 +142,24 @@ alex.send({ t: 'delete', to: alex2.id, msgId: 'msg-0001', forAll: true });
 const del = await alex2.ofType('delete');
 del.msgId === 'msg-0001' ? pass('delete propagated (no edit path exists)') : fail('delete wrong msgId');
 
+alex2.send({ t: 'seen', to: alex.id, msgId: 'msg-0001' });
+const seen = await alex.ofType('seen');
+seen.msgId === 'msg-0001' && seen.by === alex2.id
+  ? pass('read receipt routed with sender attribution')
+  : fail('seen receipt wrong');
+
+alex2.send({ t: 'kept', to: alex.id, msgId: 'msg-0001' });
+const kept = await alex.ofType('kept');
+kept.msgId === 'msg-0001' && kept.by === alex2.id
+  ? pass('keep notice routed with sender attribution')
+  : fail('kept notice wrong');
+
+alex2.send({ t: 'reset', to: alex.id });
+const reset = await alex.ofType('reset');
+reset.by === alex2.id
+  ? pass('session reset request routed with sender attribution')
+  : fail('reset routing wrong');
+
 const sdp = b64(Buffer.from('v=0\r\no=- 99 2 IN IP4 127.0.0.1\r\na=ice-ufrag:HUSH\r\n'));
 alex.send({ t: 'rtc', to: alex2.id, envelope: sdp });
 const rtc = await alex2.ofType('msg');

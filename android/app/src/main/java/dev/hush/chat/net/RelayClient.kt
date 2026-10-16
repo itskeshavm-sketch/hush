@@ -136,6 +136,7 @@ class RelayClient(
     fun disconnect() {
         reconnectJob?.cancel()
         reconnectJob = null
+        helloAcked = false
         socket?.close(NORMAL_CLOSURE, "client disconnect")
         socket = null
         _state.value = RelayState.Idle
@@ -174,10 +175,27 @@ class RelayClient(
     // -------------------------------------------------------------------------
 
     /**
-     * Queue a frame. Returns false if the socket is not currently writable —
-     * the caller decides whether that is a user-visible error or a silent drop.
+     * Whether the relay has acknowledged our hello on this socket.
+     *
+     * Frames sent after a reconnect but before the welcome are rejected with
+     * "send hello first" — a raw relay error that used to surface as a toast
+     * and, worse, burned the send (the message was marked failed for a
+     * handshake race, not a real failure). Gating here turns those sends into
+     * quiet `false`s, so the caller queues instead of alarming.
      */
-    fun send(frame: JSONObject): Boolean = socket?.send(frame.toString()) ?: false
+    @Volatile
+    var helloAcked: Boolean = false
+        private set
+
+    /**
+     * Queue a frame. Returns false if the socket is not currently usable —
+     * unwritable, or connected but not yet welcomed — and the caller decides
+     * whether that is a user-visible error or a silent drop.
+     */
+    fun send(frame: JSONObject): Boolean {
+        if (!helloAcked) return false
+        return socket?.send(frame.toString()) ?: false
+    }
 
     fun sendMessage(to: String, sealedPayload: ByteArray) = send(
         JSONObject()
@@ -198,11 +216,46 @@ class RelayClient(
         JSONObject().put("t", "delete").put("to", to).put("msgId", messageId).put("forAll", true)
     )
 
+    /**
+     * Read receipt and keep notice. Fire-and-forget like typing: if the peer
+     * is offline the relay drops it, and the ViewModel re-sends unacked
+     * receipts when the peer reappears. No error surfacing — a receipt is
+     * retryable bookkeeping, not a message.
+     */
+    fun sendSeen(to: String, messageId: String) = send(
+        JSONObject().put("t", "seen").put("to", to).put("msgId", messageId)
+    )
+
+    fun sendKept(to: String, messageId: String) = send(
+        JSONObject().put("t", "kept").put("to", to).put("msgId", messageId)
+    )
+
+    /**
+     * Ask a peer to drop their ratchet session for us. Sent (throttled) when
+     * their messages stop decrypting: they keep encrypting on a stale session
+     * while we fail every frame, and nothing heals until THEY re-handshake.
+     * The next message from either side establishes a fresh X3DH session.
+     */
+    fun sendReset(to: String) = send(
+        JSONObject().put("t", "reset").put("to", to)
+    )
+
     fun sendTyping(to: String, active: Boolean) = send(
         JSONObject().put("t", "typing").put("to", to).put("state", active)
     )
 
     fun sendProfile(bio: String) = send(JSONObject().put("t", "profile").put("bio", bio))
+
+    /**
+     * Ask the relay for a fresh unicast roster snapshot.
+     *
+     * Broadcasts can be missed — a frame dropped on a flaky socket is gone,
+     * and the next broadcast only comes on the next join/leave. Polling this
+     * every ~30s (see the ViewModel) bounds any staleness: the view converges
+     * to the truth even if every broadcast in between was lost. The server
+     * answers only the requester, so this costs one small frame each way.
+     */
+    fun refreshRoster() = send(JSONObject().put("t", "roster"))
 
     // -------------------------------------------------------------------------
     // Socket management
@@ -260,6 +313,7 @@ class RelayClient(
 
         override fun onOpen(webSocket: WebSocket, response: Response) {
             attempt = 0
+            helloAcked = false
             Log.i(TAG, "relay socket open")
 
             // The trust manager already observed the certificate during the
@@ -277,6 +331,7 @@ class RelayClient(
 
             // Must be serialised here: WebSocket.send takes a String or a
             // ByteString, and `let(webSocket::send)` hands it a JSONObject.
+            // Hello bypasses the helloAcked gate — it IS the handshake.
             hello?.let { webSocket.send(it.toString()) }
         }
 
@@ -291,6 +346,7 @@ class RelayClient(
 
             when (frame.optString("t")) {
                 "welcome" -> {
+                    helloAcked = true
                     _state.value = RelayState.Connected
                     frame.optJSONArray("peers")?.let { _roster.value = it.toPeerList() }
                 }
@@ -308,11 +364,13 @@ class RelayClient(
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+            helloAcked = false
             _state.value = RelayState.Idle
             if (code != NORMAL_CLOSURE) scheduleReconnect(reason.ifEmpty { "closed ($code)" })
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+            helloAcked = false
             val message = t.message ?: t.javaClass.simpleName
 
             // A pin failure is terminal by design. Retrying a handshake that

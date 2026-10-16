@@ -18,7 +18,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.lifecycle.Lifecycle
@@ -135,17 +137,25 @@ private fun HushRoot(viewModel: HushViewModel = viewModel()) {
             is Screen.Chat -> {
                 val peer = peers.firstOrNull { it.id == s.peerId }
                 val context = LocalContext.current
+                var disappearing by remember(s.peerId) { mutableStateOf(viewModel.disappearingFor(s.peerId)) }
                 ChatScreen(
                     peerName = s.peerName,
                     peerSeed = s.peerId.fold(0) { acc, c -> (acc * 31 + c.code) and 0x7FFFFFFF },
-                    peerOnline = peer?.online ?: false,
                     peerVerified = peer?.verified ?: false,
                     messages = messages,
                     peerTyping = s.peerId in typingIn,
+                    disappearingValue = disappearing,
+                    disappearingLabel = viewModel.disappearingLabel(disappearing),
+                    onSetDisappearing = {
+                        viewModel.setDisappearing(s.peerId, it)
+                        disappearing = it
+                    },
                     onBack = { viewModel.navigate(Screen.Roster) },
                     onSend = { viewModel.sendMessage(s.peerId, it) },
                     onTyping = { viewModel.onTyping(s.peerId) },
                     onDelete = { viewModel.deleteForEveryone(s.peerId, it.id) },
+                    onKeep = { viewModel.keepMessage(s.peerId, it.id) },
+                    onSendImage = { viewModel.sendImageRaw(s.peerId, it) },
                     onRetry = { viewModel.retryMessage(s.peerId, it.id) },
                     onVoiceCall = { dev.hush.chat.call.CallOutgoing.start(context, s.peerId, video = false) },
                     onVideoCall = { dev.hush.chat.call.CallOutgoing.start(context, s.peerId, video = true) },

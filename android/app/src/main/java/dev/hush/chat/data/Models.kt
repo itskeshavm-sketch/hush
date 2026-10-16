@@ -35,7 +35,7 @@ data class Peer(
 /** How a message was delivered. */
 enum class DeliveryState { PENDING, SENT, FAILED }
 
-enum class MessageKind { TEXT, CALL_SIGNALING, SYSTEM }
+enum class MessageKind { TEXT, CALL_SIGNALING, SYSTEM, IMAGE }
 
 data class Message(
     val id: String,
@@ -49,6 +49,30 @@ data class Message(
     /** True when the local user removed this message for everyone. */
     val deletedForEveryone: Boolean,
     val attachmentLabel: String? = null,
+    /**
+     * Disappearing-message bookkeeping. All three default to "never":
+     *
+     * - [seenAt]: when this side saw it (read time for inbound, receipt time
+     *   for outbound). 0 until seen.
+     * - [expiresAt]: absolute epoch ms this row self-deletes, 0 for never.
+     *   Set at insert for sent-based timers, at seen-time for seen-based ones.
+     * - [expirySeenMs]: the after-seen duration, needed to compute [expiresAt]
+     *   once [seenAt] is known. 0 when the message has no seen-based timer.
+     * - [kept]: exempt from timer expiry. Only timer expiry — an explicit
+     *   delete-for-everyone still tombstones a kept copy.
+     */
+    val seenAt: Long = 0L,
+    val expiresAt: Long = 0L,
+    val expirySeenMs: Long = 0L,
+    val kept: Boolean = false,
+    /**
+     * How this row died. False = explicitly deleted for everyone (by either
+     * side); true = its own timer ran out. The transcript renders them
+     * differently — "deleted" vs "disappeared" — because a user who set OFF
+     * and watches a received message vanish needs to see that the *sender's*
+     * timer did it, not a bug.
+     */
+    val expired: Boolean = false,
 ) {
     val isOutgoing: Boolean get() = senderId == LOCAL_SENTINEL
 
@@ -75,4 +99,19 @@ data class SearchHit(
     val peerName: String,
     val body: String,
     val sentAt: Long,
+)
+
+/**
+ * One unsent outgoing message: the offline outbox entry.
+ *
+ * Id plus content only — the timer policy is re-read at flush time, so
+ * a message queued under one policy and flushed under another goes out under
+ * the current one rather than failing on a stale encoding. Image rows carry
+ * their JPEG bytes as base64 in [attachment]; text rows leave it null.
+ */
+data class OutboxItem(
+    val id: String,
+    val body: String,
+    val kind: MessageKind = MessageKind.TEXT,
+    val attachment: String? = null,
 )

@@ -199,6 +199,27 @@ export class Hub {
         return;
       }
 
+      case 'seen':
+      case 'kept': {
+        const target = this.peers.get(frame.to);
+        // Receipts are fire-and-forget like typing: a receipt for an offline
+        // peer is dropped, and the sender's client re-sends unacked receipts
+        // when the peer reappears. Silence is correct.
+        if (!target) return;
+        target.deliver({ t: frame.t, by: peer.id, byName: peer.name, to: frame.to, msgId: frame.msgId, at: this.now() });
+        return;
+      }
+
+      case 'reset': {
+        const target = this.peers.get(frame.to);
+        // Fire-and-forget like typing: erroring for an offline peer would
+        // surface raw peer ids for a routine event, and the next message
+        // re-establishes the session regardless.
+        if (!target) return;
+        target.deliver({ t: 'reset', by: peer.id, byName: peer.name, to: frame.to, at: this.now() });
+        return;
+      }
+
       case 'typing': {
         const target = this.peers.get(frame.to);
         if (!target) return; // Typing indicators are fire-and-forget; silence is correct.

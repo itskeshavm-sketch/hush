@@ -147,6 +147,11 @@ fun SettingsScreen(
                 onAction = { pinStep = it; pinFirst = ""; pinError = null },
                 onLockNow = onLockNow,
             )
+            FactRow2(
+                "Disappearing timers: your timer applies to messages you send. " +
+                    "Messages you receive follow the sender's timer — yours being " +
+                    "off never keeps someone else's timed message.",
+            )
 
             Spacer(Modifier.height(14.dp))
 

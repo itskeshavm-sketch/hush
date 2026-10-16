@@ -67,7 +67,12 @@ class HushStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
                 state            INTEGER NOT NULL,
                 kind             INTEGER NOT NULL DEFAULT 0,
                 deleted          INTEGER NOT NULL DEFAULT 0,
-                attachment       TEXT
+                attachment       TEXT,
+                seen_at          INTEGER NOT NULL DEFAULT 0,
+                expires_at       INTEGER NOT NULL DEFAULT 0,
+                exp_seen_ms      INTEGER NOT NULL DEFAULT 0,
+                kept             INTEGER NOT NULL DEFAULT 0,
+                expired          INTEGER NOT NULL DEFAULT 0
             )
             """.trimIndent()
         )
@@ -123,6 +128,23 @@ class HushStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
         // `messages` — a half-migrated FTS index returns confidently wrong
         // search results, which is worse than no search.
         if (oldVersion < 1) onCreate(db)
+        if (oldVersion < 2) {
+            // Disappearing messages: seen tracking, deadlines, keep flags.
+            // Each ALTER is guarded so a half-run upgrade retries cleanly
+            // instead of dying on "duplicate column name".
+            listOf(
+                "ALTER TABLE messages ADD COLUMN seen_at INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE messages ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE messages ADD COLUMN exp_seen_ms INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE messages ADD COLUMN kept INTEGER NOT NULL DEFAULT 0",
+            ).forEach { runCatching { db.execSQL(it) } }
+        }
+        if (oldVersion < 3) {
+            // Expired-vs-deleted distinction for the transcript. Old expired
+            // rows keep expired = 0 and render as deleted — factually fine,
+            // they were removed either way.
+            runCatching { db.execSQL("ALTER TABLE messages ADD COLUMN expired INTEGER NOT NULL DEFAULT 0") }
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -199,20 +221,20 @@ class HushStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
     /**
      * Reconcile the local peer table with a fresh roster.
      *
-     * Two problems this exists to fix, both observed in the field:
+     * Peers the relay no longer reports are marked offline, never deleted.
+     * That is what makes offline chat possible: you can open a conversation
+     * with someone who is gone, write to them, and the message waits in the
+     * local outbox until the relay reports them again. Deleting message-less
+     * rows used to keep test probes from lingering, but it also deleted every
+     * real peer the moment they disconnected — so a contact you had never
+     * messaged vanished entirely instead of reading "offline".
      *
-     *  1. Ghosts that never leave. `upsertPeers` only ever inserts or replaces,
-     *     so a peer that disconnects stays `online = 1` forever. Worse, relay
-     *     test probes with throwaway names ended up permanently listed on a
-     *     real device that happened to be online during the test.
+     * The tradeoff is accepted deliberately: a throwaway test name lingers as
+     * an offline row until reinstall. A contact list that eats real people is
+     * worse than one that keeps fake ones.
      *
-     *  2. Unbounded growth. A reinstall mints a new identity, which means a new
-     *     peer id for the same human. The old row would linger as a second,
-     *     permanently offline entry with the same display name.
-     *
-     * Rows that have conversation history are kept and marked offline — history
-     * must never be garbage-collected out from under the user. Rows with no
-     * messages at all are roster cruft and are deleted outright.
+     * No message content is retained by the relay for this. The queue lives in
+     * this device's outbox; the relay still stores nothing.
      */
     suspend fun reconcilePeers(liveIds: List<String>) = withContext(Dispatchers.IO) {
         ioLock.write {
@@ -221,21 +243,10 @@ class HushStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
             try {
                 if (liveIds.isEmpty()) {
                     db.execSQL("UPDATE peers SET online = 0")
-                    db.execSQL(
-                        "DELETE FROM peers WHERE id NOT IN (SELECT DISTINCT conversation_id FROM messages)",
-                    )
                 } else {
                     val placeholders = liveIds.joinToString(",") { "?" }
                     db.execSQL(
                         "UPDATE peers SET online = 0 WHERE id NOT IN ($placeholders)",
-                        liveIds.toTypedArray(),
-                    )
-                    db.execSQL(
-                        """
-                        DELETE FROM peers
-                        WHERE id NOT IN ($placeholders)
-                          AND id NOT IN (SELECT DISTINCT conversation_id FROM messages)
-                        """.trimIndent(),
                         liveIds.toTypedArray(),
                     )
                 }
@@ -300,6 +311,11 @@ class HushStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
                     put("kind", message.kind.ordinal)
                     put("deleted", if (message.deletedForEveryone) 1 else 0)
                     message.attachmentLabel?.let { put("attachment", it) }
+                    put("seen_at", message.seenAt)
+                    put("expires_at", message.expiresAt)
+                    put("exp_seen_ms", message.expirySeenMs)
+                    put("kept", if (message.kept) 1 else 0)
+                    put("expired", if (message.expired) 1 else 0)
                 },
                 SQLiteDatabase.CONFLICT_REPLACE,
             )
@@ -323,6 +339,10 @@ class HushStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
      * also destroy the rowid-to-message mapping that a recipient needs to
      * reconcile an inbound delete against a local copy. Blanking the text is
      * irreversible to search while keeping the row's identity.
+     *
+     * This is the EXPLICIT path: expired stays 0, so the transcript renders
+     * "deleted". Timer expiry is the separate [expireDue] path, which marks
+     * expired so the transcript renders "disappeared".
      */
     suspend fun markDeletedForEveryone(messageId: String) = withContext(Dispatchers.IO) {
         ioLock.write {
@@ -347,7 +367,8 @@ class HushStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
             ioLock.read {
                 readableDatabase.rawQuery(
                     """
-                    SELECT id, conversation_id, sender_id, sender_name, body, sent_at, state, kind, deleted, attachment
+                    SELECT id, conversation_id, sender_id, sender_name, body, sent_at, state, kind, deleted, attachment,
+                           seen_at, expires_at, exp_seen_ms, kept, expired
                     FROM messages
                     WHERE conversation_id = ?
                     ORDER BY sent_at DESC
@@ -369,10 +390,243 @@ class HushStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
                                     kind = MessageKind.entries.getOrElse(c.getInt(7)) { MessageKind.TEXT },
                                     deletedForEveryone = c.getInt(8) == 1,
                                     attachmentLabel = c.getString(9),
+                                    seenAt = c.getLong(10),
+                                    expiresAt = c.getLong(11),
+                                    expirySeenMs = c.getLong(12),
+                                    kept = c.getInt(13) == 1,
+                                    expired = c.getInt(14) == 1,
                                 )
                             )
                         }
                     }.reversed() // oldest first for the transcript
+                }
+            }
+        }
+
+    // -------------------------------------------------------------------------
+    // Disappearing messages
+    // -------------------------------------------------------------------------
+
+    /**
+     * Tombstone everything whose deadline has passed. Keep-exempt rows survive;
+     * an explicit delete-for-everyone is a separate path that ignores [kept].
+     *
+     * Expired rows are marked expired = 1 (explicit deletes leave it 0), so
+     * the transcript can say "disappeared" instead of "deleted".
+     *
+     * The body-blanking reuses the same UPDATE trigger as manual deletes, so
+     * expired text leaves search exactly the way a deleted message does.
+     *
+     * @return how many rows were tombstoned, so the caller knows whether any
+     *   open transcript needs a reload.
+     */
+    suspend fun expireDue(nowMs: Long): Int = withContext(Dispatchers.IO) {
+        ioLock.write {
+            var count = 0
+            readableDatabase.rawQuery(
+                "SELECT COUNT(*) FROM messages WHERE deleted = 0 AND kept = 0 AND expires_at > 0 AND expires_at <= ?",
+                arrayOf(nowMs.toString()),
+            ).use { c -> if (c.moveToFirst()) count = c.getInt(0) }
+            if (count > 0) {
+                writableDatabase.execSQL(
+                    "UPDATE messages SET deleted = 1, expired = 1, body = '' WHERE deleted = 0 AND kept = 0 AND expires_at > 0 AND expires_at <= ?",
+                    arrayOf<Any>(nowMs),
+                )
+            }
+            count
+        }
+    }
+
+    /**
+     * A read receipt arrived for one of our sent messages: record when the
+     * peer saw it, and arm the deadline if it carries an after-seen timer.
+     *
+     * First receipt wins (`seen_at = 0` guard). Receipts are re-sent as
+     * duplicates can arrive — the receiver retries them to heal a dropped
+     * frame — and every re-send must not push our deadline further out, or a
+     * "2 min after seen" message would live as long as duplicates keep
+     * arriving. The deadline anchors at the first time the peer saw it.
+     */
+    suspend fun markPeerSeen(messageId: String, seenAtMs: Long) = withContext(Dispatchers.IO) {
+        ioLock.write {
+            writableDatabase.execSQL(
+                """
+                UPDATE messages
+                SET seen_at = ?,
+                    expires_at = CASE WHEN exp_seen_ms > 0 THEN ? + exp_seen_ms ELSE expires_at END
+                WHERE id = ? AND sender_id = ? AND seen_at = 0
+                """.trimIndent(),
+                arrayOf<Any>(seenAtMs, seenAtMs, messageId, Message.LOCAL_SENTINEL),
+            )
+        }
+    }
+
+    /**
+     * We displayed inbound messages: record local seen time and arm their
+     * after-seen deadlines. Only rows that actually carry a seen-based timer
+     * and have never been seen — everything else is a wasted write.
+     */
+    suspend fun markLocalSeen(conversationId: String, seenAtMs: Long) = withContext(Dispatchers.IO) {
+        ioLock.write {
+            writableDatabase.execSQL(
+                """
+                UPDATE messages
+                SET seen_at = ?, expires_at = ? + exp_seen_ms
+                WHERE conversation_id = ? AND sender_id != ?
+                  AND deleted = 0 AND seen_at = 0 AND exp_seen_ms > 0
+                """.trimIndent(),
+                arrayOf<Any>(seenAtMs, seenAtMs, conversationId, Message.LOCAL_SENTINEL),
+            )
+        }
+    }
+
+    /** Inbound expiring messages we have never shown, oldest first, capped. */
+    suspend fun unseenInboundIds(conversationId: String, limit: Int = 100): List<String> =
+        withContext(Dispatchers.IO) {
+            ioLock.read {
+                readableDatabase.rawQuery(
+                    """
+                    SELECT id FROM messages
+                    WHERE conversation_id = ? AND sender_id != ?
+                      AND deleted = 0 AND seen_at = 0 AND exp_seen_ms > 0
+                    ORDER BY sent_at ASC
+                    LIMIT ?
+                    """.trimIndent(),
+                    arrayOf(conversationId, Message.LOCAL_SENTINEL, limit.toString()),
+                ).use { c ->
+                    buildList {
+                        while (c.moveToNext()) add(c.getString(0))
+                    }
+                }
+            }
+        }
+
+    /** Exempt a message from timer expiry. Explicit deletes still apply. */
+    suspend fun setKept(messageId: String, kept: Boolean) = withContext(Dispatchers.IO) {
+        ioLock.write {
+            writableDatabase.execSQL(
+                "UPDATE messages SET kept = ? WHERE id = ?",
+                arrayOf<Any>(if (kept) 1 else 0, messageId),
+            )
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Offline outbox
+    // -------------------------------------------------------------------------
+
+    /**
+     * Unsent outgoing messages for one conversation, oldest first.
+     *
+     * These are the rows a send attempt left behind as PENDING or FAILED —
+     * the peer was offline, we were offline, or the bundle had not arrived
+     * yet. They are the offline queue: the relay stores nothing for absent
+     * peers, so the sender's device holds them and flushes them when the peer
+     * reappears. Tombstoned rows are excluded — a message whose own timer
+     * expired before delivery must never be delivered late.
+     */
+    suspend fun pendingOutgoing(conversationId: String, limit: Int = 100): List<OutboxItem> =
+        withContext(Dispatchers.IO) {
+            ioLock.read {
+                readableDatabase.rawQuery(
+                    """
+                    SELECT id, body, kind, attachment FROM messages
+                    WHERE conversation_id = ? AND sender_id = ?
+                      AND deleted = 0 AND state != ?
+                    ORDER BY sent_at ASC
+                    LIMIT ?
+                    """.trimIndent(),
+                    arrayOf(
+                        conversationId,
+                        Message.LOCAL_SENTINEL,
+                        DeliveryState.SENT.ordinal.toString(),
+                        limit.toString(),
+                    ),
+                ).use { c ->
+                    buildList {
+                        while (c.moveToNext()) add(
+                            OutboxItem(
+                                id = c.getString(0),
+                                body = c.getString(1) ?: "",
+                                kind = MessageKind.entries.getOrElse(c.getInt(2)) { MessageKind.TEXT },
+                                attachment = c.getString(3),
+                            )
+                        )
+                    }
+                }
+            }
+        }
+
+    /** True when this conversation holds unsent outgoing rows. Cheap gate for flush. */
+    suspend fun hasPending(conversationId: String): Boolean = withContext(Dispatchers.IO) {
+        ioLock.read {
+            readableDatabase.rawQuery(
+                """
+                SELECT 1 FROM messages
+                WHERE conversation_id = ? AND sender_id = ?
+                  AND deleted = 0 AND state != ?
+                LIMIT 1
+                """.trimIndent(),
+                arrayOf(
+                    conversationId,
+                    Message.LOCAL_SENTINEL,
+                    DeliveryState.SENT.ordinal.toString(),
+                ),
+            ).use { c -> c.moveToFirst() }
+        }
+    }
+
+    /**
+     * Move recently-sent rows back to the outbox for re-delivery.
+     *
+     * Used when a peer reports they cannot decrypt us: everything we sent
+     * recently went out on a stale session — relay-accepted but unreadable,
+     * so the rows sit at SENT while the peer saw nothing. Re-queueing them
+     * under the fresh session (same stable ids, so the receiver's replace is
+     * idempotent) restores what would otherwise be a silent hole.
+     *
+     * Windowed, deliberately: re-sending the whole history would overwrite
+     * the receiver's seen/kept state via CONFLICT_REPLACE. Recent messages
+     * are the desync case (reinstall-then-chat); older ones stay as-is.
+     */
+    suspend fun demoteRecent(conversationId: String, sinceMs: Long) = withContext(Dispatchers.IO) {
+        ioLock.write {
+            writableDatabase.execSQL(
+                """
+                UPDATE messages SET state = ?
+                WHERE conversation_id = ? AND sender_id = ?
+                  AND deleted = 0 AND state = ? AND sent_at >= ?
+                """.trimIndent(),
+                arrayOf<Any>(
+                    DeliveryState.PENDING.ordinal,
+                    conversationId,
+                    Message.LOCAL_SENTINEL,
+                    DeliveryState.SENT.ordinal,
+                    sinceMs,
+                ),
+            )
+        }
+    }
+    /**
+     * Locally-seen inbound timer messages for receipt re-sends.
+     * @param sinceMs only rows seen at or after this time; 0 means all.
+     */
+    suspend fun seenTimerIds(conversationId: String, sinceMs: Long = 0L, limit: Int = 100): List<String> =
+        withContext(Dispatchers.IO) {
+            ioLock.read {
+                readableDatabase.rawQuery(
+                    """
+                    SELECT id FROM messages
+                    WHERE conversation_id = ? AND sender_id != ?
+                      AND deleted = 0 AND exp_seen_ms > 0 AND seen_at >= ?
+                    ORDER BY seen_at DESC
+                    LIMIT ?
+                    """.trimIndent(),
+                    arrayOf(conversationId, Message.LOCAL_SENTINEL, sinceMs.toString(), limit.toString()),
+                ).use { c ->
+                    buildList {
+                        while (c.moveToNext()) add(c.getString(0))
+                    }
                 }
             }
         }
@@ -448,6 +702,6 @@ class HushStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
 
     companion object {
         const val DB_NAME = "hush.db"
-        const val DB_VERSION = 1
+        const val DB_VERSION = 3
     }
 }

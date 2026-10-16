@@ -490,13 +490,28 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
      * routing id (`p_…`), which is meaningless on screen — so ids are mapped
      * to display names before anything reaches a toast. An unmappable id
      * falls back to "that peer" rather than leaking wire internals.
+     *
+     * `unknown_peer` also repairs state: sends are marked SENT optimistically
+     * on socket-write success, but the relay drops them when the target has
+     * no live socket. Without a demote here those rows stay SENT forever —
+     * excluded from the offline queue — and never flush when the peer
+     * returns. Demoting recent SENT back to PENDING puts them back in the
+     * queue; re-delivery is idempotent by stable id.
      */
-    private fun handleRelayError(frame: JSONObject) {
+    private suspend fun handleRelayError(frame: JSONObject) {
         val code = frame.optString("code")
         val raw = frame.optString("message").ifEmpty { "relay error" }
         if (code == "unknown_peer") {
             val id = raw.substringBefore(" is offline").takeIf { raw.endsWith(" is offline") }
             val name = id?.let { peerNameFor(it) } ?: "That peer"
+            if (id != null) {
+                runCatching {
+                    store.demoteRecent(id, System.currentTimeMillis() - OFFLINE_DEMOTE_WINDOW_MS)
+                }
+                if ((_screen.value as? Screen.Chat)?.peerId == id) {
+                    runCatching { _messages.value = store.loadMessages(id) }
+                }
+            }
             emitToast("$name is offline — message queued, sends when they're back")
             return
         }
@@ -644,7 +659,18 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
                     emitToast("Can't reach ${peer?.displayName ?: "peer"} yet — message queued, sends when they're back")
                 }
             } else if (relay.sendMessage(peerId, sealed)) {
-                store.updateState(id, DeliveryState.SENT)
+                // The socket write succeeding does NOT mean the peer got it:
+                // the relay drops sends for offline peers and reports
+                // unknown_peer async. If the roster already knows they are
+                // offline, keep this PENDING so the flush picks it up instead
+                // of stranding it as SENT. (Stale-online races are repaired
+                // by the demote in handleRelayError.)
+                if (peer?.online == false) {
+                    store.updateState(id, DeliveryState.FAILED)
+                    emitToast("${peer.displayName.ifEmpty { "Peer" }} is offline — message queued, sends when they're back")
+                } else {
+                    store.updateState(id, DeliveryState.SENT)
+                }
             } else {
                 store.updateState(id, DeliveryState.FAILED)
                 emitToast("Not connected — message held")
@@ -758,7 +784,12 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
             store.insertMessage(message)
             _messages.value = store.loadMessages(peerId)
             if (sendImageBytes(peerId, id, "", jpegBytes)) {
-                store.updateState(id, DeliveryState.SENT)
+                if (_peers.value.firstOrNull { it.id == peerId }?.online == false) {
+                    store.updateState(id, DeliveryState.FAILED)
+                    emitToast("They're offline — image queued, sends when they're back")
+                } else {
+                    store.updateState(id, DeliveryState.SENT)
+                }
             } else {
                 store.updateState(id, DeliveryState.FAILED)
                 emitToast("Can't reach them yet — image queued, sends when they're back")
@@ -1399,6 +1430,14 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
          * its state rather than being re-sealed under today's timer policy.
          */
         private const val RESET_RESEND_WINDOW_MS = 10L * 60L * 1000L
+
+        /**
+         * How far back an offline-error demote reaches. Ten minutes covers a
+         * burst sent right before the relay reported the peer gone. Older
+         * SENT rows keep their state so a late error cannot resurrect — and
+         * re-deliver — history the peer already saw.
+         */
+        private const val OFFLINE_DEMOTE_WINDOW_MS = 10L * 60L * 1000L
 
         /**
          * The public relay every install connects to by default.

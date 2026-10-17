@@ -626,10 +626,15 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
         _screen.value = Screen.Chat(peerId, peer.displayName)
         viewModelScope.launch {
             _messages.value = store.loadMessages(peerId)
-            // Opening a chat IS seeing it. Receipts go out for everything
-            // unacked, plus a re-send of already-seen timer messages — after
-            // an app restart the first receipt may be the one that never left,
-            // and only a duplicate heals the sender's deadline.
+            // Opening a chat IS reading it: stamp opened_at so the unread
+            // badge clears, and keep it clear for anything that arrives while
+            // the chat is open (the inbound path stamps again on new mail).
+            store.markOpened(peerId)
+            _peers.value = store.loadPeers()
+            // Receipts go out for everything unacked, plus a re-send of
+            // already-seen timer messages — after an app restart the first
+            // receipt may be the one that never left, and only a duplicate
+            // heals the sender's deadline.
             flushSeenReceipts(peerId, resendSeenSinceMs = 0L)
         }
     }
@@ -1081,6 +1086,8 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
         _screen.value = Screen.Group(groupId, info.name)
         viewModelScope.launch {
             _messages.value = store.loadMessages(groupId)
+            store.markOpened(groupId)
+            refreshGroups()
             flushGroupSeenReceipts(groupId)
         }
     }
@@ -1145,6 +1152,10 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
         val members = org.json.JSONArray()
+        // Full roster, creator included and first: the invitee must learn who
+        // else is in the group, and index order is the join order that
+        // determines admin succession. Self-addressing is prevented at the
+        // send layer instead (RelayClient.send), which is where it belongs.
         info.memberIds.forEach { members.put(it) }
         val sealed = sealFor(memberId) {
             // History rides only if the whole frame stays comfortably under
@@ -1479,6 +1490,9 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
             )
         )
         if (openConversationId() == groupId) {
+            // Reading it right now: keep opened_at ahead of the arrival so a
+            // message landing in the open transcript does not badge it.
+            store.markOpened(groupId)
             flushGroupSeenReceipts(groupId)
         } else {
             refreshGroups()
@@ -1693,6 +1707,11 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
         val fresh = store.unseenInboundIds(peerId)
         val resend = resendSeenSinceMs?.let { store.seenTimerIds(peerId, it) } ?: emptyList()
         val ids = (fresh + resend).distinct()
+        // Reading it right now: keep opened_at ahead of any arrival so a
+        // message landing in the open transcript never badges it. Independent
+        // of the receipt path, which returns early when nothing is unacked.
+        store.markOpened(peerId)
+        _peers.value = store.loadPeers()
         if (ids.isEmpty()) return
         ids.forEach { relay.sendSeen(peerId, it) }
         if (fresh.isNotEmpty()) {

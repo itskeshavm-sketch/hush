@@ -28,8 +28,10 @@ data class Peer(
             .joinToString("") { it.first().uppercase() }
             .ifEmpty { "?" }
 
-    override fun equals(other: Any?): Boolean = other is Peer && other.id == id
-    override fun hashCode(): Int = id.hashCode()
+    // No id-only equals/hashCode override. The roster is a StateFlow and the
+    // UI diffs by equality, so an id-only comparison made a changed unread
+    // count (or a new display name) compare equal to the old row: StateFlow
+    // deduplicated the emission and the badge silently never updated.
 }
 
 /** How a message was delivered. */
@@ -138,6 +140,11 @@ data class GroupInfo(
             .joinToString("") { it.first().uppercase() }
             .ifEmpty { "#" }
 
-    override fun equals(other: Any?): Boolean = other is GroupInfo && other.id == id
-    override fun hashCode(): Int = id.hashCode()
+    // Deliberately NO id-only equals/hashCode override. It was here, and it
+    // was a bug: `_groups.value = store.listGroups()` produced a list that
+    // compared equal to the previous one whenever ids matched, StateFlow
+    // deduplicated the emission, and recomposition never ran. The symptom was
+    // a rename, a member count, or an admin badge that visibly refused to
+    // update while the system notice for the same event rendered fine.
+    // Structural equality is required for a state class the UI diffs.
 }

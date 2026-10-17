@@ -718,13 +718,24 @@ class HushStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
     // Private groups
     // -------------------------------------------------------------------------
 
-    /** Create or update a group row. Members are managed separately. */
+    /**
+     * Create or (re-)join a group row. Members are managed separately.
+     *
+     * `deleted = 0` is reset on conflict, and that is load-bearing. Removing
+     * someone wipes the group by flagging `deleted = 1` (a tombstone, so a
+     * late `remove` frame cannot resurrect it). Re-inviting that same person
+     * hits this same row id — and the old upsert updated only `name` and
+     * `admin_id`, leaving `deleted = 1`. Every read filters on `deleted = 0`,
+     * so the rejoined user got "You were added to trio" and then an app with
+     * no such group in the roster: a working invite into an invisible room.
+     */
     suspend fun upsertGroup(id: String, name: String, adminId: String, createdAt: Long) =
         withContext(Dispatchers.IO) {
             ioLock.write {
                 writableDatabase.execSQL(
                     "INSERT INTO groups (id, name, admin_id, created_at, deleted) VALUES (?, ?, ?, ?, 0) " +
-                        "ON CONFLICT(id) DO UPDATE SET name = excluded.name, admin_id = excluded.admin_id",
+                        "ON CONFLICT(id) DO UPDATE SET name = excluded.name, admin_id = excluded.admin_id, " +
+                        "deleted = 0",
                     arrayOf<Any>(id, name, adminId, createdAt),
                 )
             }

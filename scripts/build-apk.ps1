@@ -105,9 +105,21 @@ if (Test-Path $testXml) {
     New-Item -ItemType Directory -Force -Path $results | Out-Null
     Copy-Item -Force (Join-Path $testXml '*.xml') $results -ErrorAction SilentlyContinue
 
-    [xml]$summary = (Get-Content (Join-Path $testXml 'TEST-dev.hush.chat.crypto.DoubleRatchetTest.xml') -Raw)
-    $s = $summary.testsuite
-    Write-Host ("tests     : {0} run, {1} failures, {2} errors" -f $s.tests, $s.failures, $s.errors) -ForegroundColor Green
+    # Sum EVERY suite, not just one class. Reporting a single class here said
+    # "18 run" while 34 tests had actually executed — which reads as "my new
+    # tests never ran" and sends you debugging the wrong thing.
+    $total = 0; $fail = 0; $err = 0
+    foreach ($file in Get-ChildItem $testXml -Filter '*.xml') {
+        try {
+            [xml]$doc = Get-Content $file.FullName -Raw
+            $total += [int]$doc.testsuite.tests
+            $fail += [int]$doc.testsuite.failures
+            $err += [int]$doc.testsuite.errors
+        } catch {
+            Write-Host "could not read $($file.Name)" -ForegroundColor Yellow
+        }
+    }
+    Write-Host ("tests     : {0} run, {1} failures, {2} errors" -f $total, $fail, $err) -ForegroundColor Green
 }
 
 Write-Host "`nOK" -ForegroundColor Green

@@ -50,7 +50,8 @@ class HushStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
                 safety_number  TEXT NOT NULL DEFAULT '',
                 verified       INTEGER NOT NULL DEFAULT 0,
                 last_seen      INTEGER NOT NULL DEFAULT 0,
-                online         INTEGER NOT NULL DEFAULT 0
+                online         INTEGER NOT NULL DEFAULT 0,
+                opened_at      INTEGER NOT NULL DEFAULT 0
             )
             """.trimIndent()
         )
@@ -135,7 +136,8 @@ class HushStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
                 name         TEXT NOT NULL DEFAULT '',
                 admin_id     TEXT NOT NULL DEFAULT '',
                 created_at   INTEGER NOT NULL DEFAULT 0,
-                deleted      INTEGER NOT NULL DEFAULT 0
+                deleted      INTEGER NOT NULL DEFAULT 0,
+                opened_at    INTEGER NOT NULL DEFAULT 0
             )
             """.trimIndent()
         )
@@ -188,6 +190,15 @@ class HushStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
         if (oldVersion < 4) {
             // Private groups: brand-new tables, no migration of old rows.
             runCatching { createGroupTables(db) }
+        }
+        if (oldVersion < 5) {
+            // Read tracking ("opened since last message") plus the group
+            // member columns joined_at comes with the table. Each ALTER is
+            // guarded so a half-run upgrade retries cleanly.
+            listOf(
+                "ALTER TABLE peers ADD COLUMN opened_at INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE groups ADD COLUMN opened_at INTEGER NOT NULL DEFAULT 0",
+            ).forEach { runCatching { db.execSQL(it) } }
         }
     }
 
@@ -320,11 +331,11 @@ class HushStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
                 SELECT p.id, p.display_name, p.identity_pub, p.safety_number, p.verified, p.last_seen, p.online,
                        (SELECT COUNT(*) FROM messages m
                          WHERE m.conversation_id = p.id AND m.sender_id != ?
-                           AND m.deleted = 0 AND m.state != ?) AS unread
+                           AND m.deleted = 0 AND m.sent_at > p.opened_at) AS unread
                 FROM peers p
                 ORDER BY p.online DESC, p.last_seen DESC, p.display_name ASC
                 """.trimIndent(),
-                arrayOf(Message.LOCAL_SENTINEL, DeliveryState.FAILED.ordinal.toString()),
+                arrayOf(Message.LOCAL_SENTINEL),
             ).use { c ->
                 buildList {
                     while (c.moveToNext()) {
@@ -727,10 +738,16 @@ class HushStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
                 db.beginTransaction()
                 try {
                     db.execSQL("DELETE FROM group_members WHERE group_id = ?", arrayOf<Any>(groupId))
-                    memberIds.distinct().forEach { member ->
+                    // Strictly increasing joined_at, in list order. Stamping
+                    // every member with the same instant made "earliest joined"
+                    // degenerate into "lowest routing id" — so admin succession
+                    // picked an arbitrary device and the wrong phone showed
+                    // itself as admin. The invite list is ordered creator-first
+                    // by the sender, so index order IS join order.
+                    memberIds.distinct().forEachIndexed { index, member ->
                         db.execSQL(
                             "INSERT INTO group_members (group_id, peer_id, joined_at) VALUES (?, ?, ?)",
-                            arrayOf<Any>(groupId, member, joinedAt),
+                            arrayOf<Any>(groupId, member, joinedAt + index),
                         )
                     }
                     db.setTransactionSuccessful()
@@ -857,12 +874,36 @@ class HushStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
                 "SELECT peer_id FROM group_members WHERE group_id = ? ORDER BY joined_at ASC, peer_id ASC",
                 arrayOf(groupId),
             ).use { c -> buildList { while (c.moveToNext()) add(c.getString(0)) } }
+            // Unread = arrived since this device last opened the group. Not a
+            // delivery state: a message you have not looked at is unread
+            // whether it was acked, queued, or healed after a reconnect.
             val unread = db.rawQuery(
                 "SELECT COUNT(*) FROM messages WHERE conversation_id = ? AND sender_id != ? " +
-                    "AND deleted = 0 AND state != ?",
-                arrayOf(groupId, Message.LOCAL_SENTINEL, DeliveryState.FAILED.ordinal.toString()),
+                    "AND deleted = 0 AND sent_at > (SELECT opened_at FROM groups WHERE id = ?)",
+                arrayOf(groupId, Message.LOCAL_SENTINEL, groupId),
             ).use { c -> if (c.moveToFirst()) c.getInt(0) else 0 }
-            GroupInfo(meta.first, meta.second.first, meta.second.second, meta.second.third, members, unread)
+            // Admin is DERIVED, never read from the cached column: the cache
+            // is only written by whoever performed the last local edit, so on
+            // every other member it goes stale the moment someone leaves or is
+            // removed — which is exactly how a non-admin app showed "You are
+            // the admin" and silently rejected the real admin's control frames.
+            val admin = members.firstOrNull() ?: meta.second.second
+            GroupInfo(meta.first, meta.second.first, admin, meta.second.third, members, unread)
+        }
+    }
+
+    /** Stamp a chat as opened now — clears its unread badge. */
+    suspend fun markOpened(conversationId: String) = withContext(Dispatchers.IO) {
+        ioLock.write {
+            val db = writableDatabase
+            db.execSQL(
+                "UPDATE peers SET opened_at = ? WHERE id = ?",
+                arrayOf<Any>(System.currentTimeMillis(), conversationId),
+            )
+            db.execSQL(
+                "UPDATE groups SET opened_at = ? WHERE id = ?",
+                arrayOf<Any>(System.currentTimeMillis(), conversationId),
+            )
         }
     }
 
@@ -1091,6 +1132,6 @@ class HushStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
 
     companion object {
         const val DB_NAME = "hush.db"
-        const val DB_VERSION = 4
+        const val DB_VERSION = 5
     }
 }

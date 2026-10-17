@@ -188,12 +188,30 @@ class RelayClient(
         private set
 
     /**
+     * Our own routing id, learned from the welcome frame. Used to refuse
+     * self-addressed frames before they reach the relay: the relay rejects
+     * them with `self_target`, which the client would otherwise surface as a
+     * raw "cannot address yourself" toast for a condition the user cannot act
+     * on. A ghost peer row of ourselves used to do exactly that.
+     */
+    @Volatile
+    private var selfId: String? = null
+
+    /**
      * Queue a frame. Returns false if the socket is not currently usable —
      * unwritable, or connected but not yet welcomed — and the caller decides
      * whether that is a user-visible error or a silent drop.
      */
     fun send(frame: JSONObject): Boolean {
         if (!helloAcked) return false
+        // Never address ourselves. Frame-level, not per-call-site, so a stale
+        // self row in the roster or an invite that included us cannot get a
+        // rejection round-trip from the relay.
+        val to = frame.optString("to")
+        if (to.isNotEmpty() && to == selfId) {
+            Log.w(TAG, "refusing to send ${frame.optString("t")} addressed to self")
+            return false
+        }
         return socket?.send(frame.toString()) ?: false
     }
 
@@ -348,6 +366,7 @@ class RelayClient(
                 "welcome" -> {
                     helloAcked = true
                     _state.value = RelayState.Connected
+                    selfId = frame.optJSONObject("you")?.optString("id")?.ifEmpty { null }
                     frame.optJSONArray("peers")?.let { _roster.value = it.toPeerList() }
                 }
                 "roster" -> frame.optJSONArray("peers")?.let { _roster.value = it.toPeerList() }

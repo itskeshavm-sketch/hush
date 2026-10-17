@@ -323,7 +323,12 @@ private fun PeerRow(peer: Peer, onClick: () -> Unit) {
                 }
             }
             Text(
-                text = if (peer.unreadCount > 0) "${peer.unreadCount} unread" else "tap to open a conversation",
+                text = when {
+                    peer.unreadCount > 0 -> "${peer.unreadCount} unread"
+                    // Unread is "arrived since you last opened this chat", so
+                    // zero means you have read everything that arrived.
+                    else -> "read"
+                },
                 style = MaterialTheme.typography.bodySmall,
                 color = HushTextSecondary,
             )
@@ -364,8 +369,10 @@ private fun GroupRow(group: GroupInfo, onClick: () -> Unit) {
                 maxLines = 1,
             )
             Text(
-                text = "${group.memberIds.size} members" +
-                    if (group.unreadCount > 0) " · ${group.unreadCount} unread" else "",
+                text = buildString {
+                    append("${group.memberIds.size} members")
+                    append(if (group.unreadCount > 0) " · ${group.unreadCount} unread" else " · read")
+                },
                 style = MaterialTheme.typography.bodySmall,
                 color = HushTextSecondary,
             )

@@ -1105,7 +1105,8 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
             val groupId = "g_" + UUID.randomUUID().toString()
             val now = System.currentTimeMillis()
             store.upsertGroup(groupId, cleanName, self, now)
-            store.setGroupMembers(groupId, listOf(self) + members, now)
+            store.setGroupMembers(groupId, listOf(self) + members)
+            groupLog("create", groupId, "admin=$self members=${store.groupMembership(groupId)}")
             store.insertMessage(
                 Message(
                     id = UUID.randomUUID().toString(),
@@ -1317,10 +1318,10 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
             val fresh = peerIds.filter { it != self && it !in info.memberIds }.distinct()
                 .take((SessionManager.MAX_GROUP_MEMBERS - info.memberIds.size).coerceAtLeast(0))
             if (fresh.isEmpty()) return@launch
-            val now = System.currentTimeMillis()
-            fresh.forEach { store.addGroupMember(groupId, it, now) }
+            fresh.forEach { store.addGroupMember(groupId, it) }
             val admin = store.groupAdmin(groupId) ?: self
             store.renameGroup(groupId, info.name, admin)
+            groupLog("add-members", groupId, "admin=$admin members=${store.groupMembership(groupId)}")
             val names = fresh.joinToString { memberName(it) }
             controlToAll(groupId, "add", mapOf("member" to fresh.first(), "members" to fresh.joinToString(",")))
             groupNotice(groupId, "You added $names")
@@ -1396,6 +1397,11 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
         store.removeGroupMember(groupId, peerId)
         val admin = store.groupAdmin(groupId)
         if (admin != null) store.renameGroup(groupId, info.name, admin)
+        groupLog(
+            "member-left",
+            groupId,
+            "left=$peerId newAdmin=${admin ?: "none"} members=${store.groupMembership(groupId)}",
+        )
         val name = if (peerId == self) "You" else memberName(peerId)
         if (byAdmin) {
             sealFor(peerId) {
@@ -1509,6 +1515,11 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
         val op = control.op
         val payload = control.payload
         val self = sessions.localPeerId() ?: return
+        groupLog(
+            "control-in",
+            groupId,
+            "op=$op from=$from members=${store.groupMembership(groupId)}",
+        )
         when (op) {
             "invite" -> {
                 val name = payload.optString("name").take(SessionManager.MAX_GROUP_NAME_CHARS).ifEmpty { "Group" }
@@ -1525,7 +1536,11 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
                 if (self !in members) return
                 val known = store.groupInfo(groupId) != null
                 store.upsertGroup(groupId, name, admin, created)
-                store.setGroupMembers(groupId, members, System.currentTimeMillis())
+                // Counters re-seeded from the sender's order, not from a local
+                // clock: the inviter sends members oldest-first, so index order
+                // IS join order and every device lands on the same sequence.
+                store.setGroupMembers(groupId, members)
+                groupLog("invite-applied", groupId, "claimedAdmin=$admin members=${store.groupMembership(groupId)}")
                 if (!known) {
                     val history = payload.optJSONArray("history")
                     if (history != null) {
@@ -1566,23 +1581,29 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
             }
             "add" -> {
                 val info = store.groupInfo(groupId) ?: return
-                if (from != info.adminId) return
+                if (from != info.adminId) {
+                    groupLog("control-refused", groupId, "op=add from=$from but ourAdmin=${info.adminId}")
+                    return
+                }
                 val raw = payload.optString("members").ifEmpty { payload.optString("member") }
                 if (raw.isEmpty()) return
                 val fresh = raw.split(",").map { it.trim() }
                     .filter { it.isNotEmpty() && it !in info.memberIds }
                     .take((SessionManager.MAX_GROUP_MEMBERS - info.memberIds.size).coerceAtLeast(0))
                 if (fresh.isEmpty()) return
-                val now = System.currentTimeMillis()
-                fresh.forEach { store.addGroupMember(groupId, it, now) }
+                fresh.forEach { store.addGroupMember(groupId, it) }
                 val admin = store.groupAdmin(groupId) ?: info.adminId
                 store.renameGroup(groupId, info.name, admin)
+                groupLog("add-applied", groupId, "admin=$admin members=${store.groupMembership(groupId)}")
                 groupNotice(groupId, "${memberName(from)} added ${fresh.joinToString { memberName(it) }}")
                 refreshGroups()
             }
             "remove" -> {
                 val info = store.groupInfo(groupId) ?: return
-                if (from != info.adminId) return
+                if (from != info.adminId) {
+                    groupLog("control-refused", groupId, "op=remove from=$from but ourAdmin=${info.adminId}")
+                    return
+                }
                 val target = payload.optString("member")
                 if (target.isEmpty() || target !in info.memberIds) return
                 if (target == self) {
@@ -1601,7 +1622,10 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
             }
             "rename" -> {
                 val info = store.groupInfo(groupId) ?: return
-                if (from != info.adminId) return
+                if (from != info.adminId) {
+                    groupLog("control-refused", groupId, "op=rename from=$from but ourAdmin=${info.adminId}")
+                    return
+                }
                 val clean = payload.optString("name").trim().take(SessionManager.MAX_GROUP_NAME_CHARS)
                 if (clean.isEmpty()) return
                 store.renameGroup(groupId, clean, info.adminId)
@@ -1973,6 +1997,26 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
 
     fun emitToast(text: String) {
         _toast.value = Toast(text)
+    }
+
+    /**
+     * Group membership diagnostics.
+     *
+     * Admin is derived, not agreed: every phone elects the member with the
+     * lowest join counter. That is only correct if every phone holds the same
+     * counters, which is exactly what goes wrong when one device misses,
+     * rejects, or double-applies a control frame. So every decision point
+     * logs the membership it decided on, including refusals.
+     *
+     * One line, `HushGroup`, no message content — peer ids and counters only.
+     * Read it with:
+     *   adb logcat -s HushGroup
+     * If two phones log different counters for the same group id, that phone
+     * is the one that drifted; identical counters with a different admin means
+     * a logic bug instead.
+     */
+    private fun groupLog(event: String, groupId: String, detail: String) {
+        android.util.Log.i("HushGroup", "$event self=${sessions.localPeerId()} group=$groupId $detail")
     }
 
     /**

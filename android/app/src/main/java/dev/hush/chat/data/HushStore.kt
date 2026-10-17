@@ -741,19 +741,32 @@ class HushStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
             }
         }
 
-    /** Replace the full member list (invite path carries the whole roster). */
-    suspend fun setGroupMembers(groupId: String, memberIds: List<String>, joinedAt: Long) =
+    /**
+     * Replace the full member list (invite path carries the whole roster).
+     *
+     * `joinedAt` is a JOIN COUNTER, not a timestamp. It must be: every device
+     * derives the admin from the lowest counter, and HUSH has no server clock,
+     * so any wall-clock stamp is only comparable within the phone that wrote
+     * it. Two phones whose clocks differ by more than the gap between joins
+     * disagreed about who the admin was — one showed itself as admin, the
+     * other showed the real one, for the same group at the same moment.
+     *
+     * The counter is re-seeded from the list order on every invite (the
+     * inviter sends members ordered oldest-first), and `nextJoinCounter`
+     * extends it monotonically afterwards. Every device therefore walks the
+     * same counter sequence for the same membership history.
+     */
+    suspend fun setGroupMembers(groupId: String, memberIds: List<String>, joinedAt: Long = 0L) =
         withContext(Dispatchers.IO) {
             ioLock.write {
                 val db = writableDatabase
                 db.beginTransaction()
                 try {
                     db.execSQL("DELETE FROM group_members WHERE group_id = ?", arrayOf<Any>(groupId))
-                    // Strictly increasing joined_at, in list order. Stamping
-                    // every member with the same instant made "earliest joined"
-                    // degenerate into "lowest routing id" — so admin succession
-                    // picked an arbitrary device and the wrong phone showed
-                    // itself as admin. The invite list is ordered creator-first
+                    // Strictly increasing, in list order. Stamping every member
+                    // with the same value made "earliest joined" degenerate
+                    // into "lowest routing id" — so admin succession picked an
+                    // arbitrary device. The invite list is ordered oldest-first
                     // by the sender, so index order IS join order.
                     memberIds.distinct().forEachIndexed { index, member ->
                         db.execSQL(
@@ -768,12 +781,34 @@ class HushStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
             }
         }
 
-    suspend fun addGroupMember(groupId: String, peerId: String, joinedAt: Long) =
+    /**
+     * Next join counter for this group: one past the highest in use.
+     *
+     * Derived from local data only, so every device computes the same value
+     * from the same membership history without coordinating.
+     */
+    private fun nextJoinCounter(db: SQLiteDatabase, groupId: String): Long {
+        val highest = db.rawQuery(
+            "SELECT COALESCE(MAX(joined_at), -1) FROM group_members WHERE group_id = ?",
+            arrayOf(groupId),
+        ).use { c -> if (c.moveToFirst()) c.getLong(0) else -1L }
+        return highest + 1
+    }
+
+    /**
+     * Add one member at the end of the join order.
+     *
+     * The join counter is derived locally (see [nextJoinCounter]), never from
+     * the wall clock — two phones with skewed clocks would otherwise stamp
+     * different counters for the same event and each elect a different admin.
+     */
+    suspend fun addGroupMember(groupId: String, peerId: String) =
         withContext(Dispatchers.IO) {
             ioLock.write {
-                writableDatabase.execSQL(
+                val db = writableDatabase
+                db.execSQL(
                     "INSERT OR IGNORE INTO group_members (group_id, peer_id, joined_at) VALUES (?, ?, ?)",
-                    arrayOf<Any>(groupId, peerId, joinedAt),
+                    arrayOf<Any>(groupId, peerId, nextJoinCounter(db, groupId)),
                 )
             }
         }
@@ -929,9 +964,11 @@ class HushStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
     }
 
     /**
-     * Deterministic admin: earliest join wins, lowest peer id breaks ties.
-     * Every member computes the same answer from the same member table, so
-     * admin succession needs no consensus — including after the admin leaves.
+     * Deterministic admin: lowest join counter wins, peer id breaks ties.
+     *
+     * Every member computes the same answer from the same membership history,
+     * so admin succession needs no consensus — including after the admin
+     * leaves. The counter is NOT a timestamp: see [setGroupMembers].
      */
     suspend fun groupAdmin(groupId: String): String? = withContext(Dispatchers.IO) {
         ioLock.read {
@@ -939,6 +976,30 @@ class HushStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
                 "SELECT peer_id FROM group_members WHERE group_id = ? ORDER BY joined_at ASC, peer_id ASC LIMIT 1",
                 arrayOf(groupId),
             ).use { c -> if (c.moveToFirst()) c.getString(0) else null }
+        }
+    }
+
+    /**
+     * Group membership with join counters, for diagnostics.
+     *
+     * Logged whenever a control frame is applied or refused. When two phones
+     * disagree about who the admin is, this line is the whole story: the
+     * counters either match (a logic bug) or they do not (a device is
+     * applying a different membership history).
+     */
+    suspend fun groupMembership(groupId: String): String = withContext(Dispatchers.IO) {
+        ioLock.read {
+            readableDatabase.rawQuery(
+                "SELECT peer_id, joined_at FROM group_members WHERE group_id = ? ORDER BY joined_at ASC, peer_id ASC",
+                arrayOf(groupId),
+            ).use { c ->
+                buildString {
+                    while (c.moveToNext()) {
+                        if (isNotEmpty()) append(",")
+                        append(c.getString(0)).append('#').append(c.getLong(1))
+                    }
+                }
+            }
         }
     }
 

@@ -12,10 +12,12 @@
  * it ever accompanied, so names never touch stdout.
  */
 
-// node:https, not node:http. `server.listen()` has no TLS parameter — a plain
-// http.Server handed a {key, cert} pair just speaks cleartext, which fails at
-// handshake time with a baffling "wrong version number" from every client.
+// node:https, not node:http, in the default TLS mode. `server.listen()` has
+// no TLS parameter — a plain http.Server handed a {key, cert} pair just speaks
+// cleartext, which fails at handshake time with a baffling "wrong version
+// number" from every client.
 import { createServer as createHttpsServer } from 'node:https';
+import { createServer as createHttpServer } from 'node:http';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -28,6 +30,15 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.HUSH_PORT ?? 8443);
 const HOST = process.env.HUSH_HOST ?? '0.0.0.0';
 const HEALTH_PATH = '/healthz';
+
+/**
+ * Plaintext mode, for `ws://127.0.0.1:8787/ws` against a relay on this same
+ * machine. Off unless explicitly requested, because cleartext is only
+ * defensible when the traffic never leaves the host — which is exactly what a
+ * loopback relay is. Binding 0.0.0.0 in this mode exposes your roster to
+ * anyone on the network, so the boot banner says so out loud.
+ */
+const INSECURE = process.env.HUSH_INSECURE === '1' || process.env.HUSH_TLS === 'off';
 
 const started = Date.now();
 
@@ -86,29 +97,35 @@ const hub = new Hub();
 
 // TLS material is loaded before the server is constructed because an https
 // server takes its key/cert at construction time, not at listen time.
-const tls = await loadTls({ domain: process.env.HUSH_DOMAIN });
+// Plaintext mode skips it entirely, which is the point: self-hosting on a
+// laptop should not require openssl.
+const tls = INSECURE ? null : await loadTls({ domain: process.env.HUSH_DOMAIN });
 
-const httpServer = createHttpsServer(
-  { key: tls.key, cert: tls.cert, minVersion: 'TLSv1.2' },
-  (req, res) => {
-    const path = (req.url ?? '/').split('?')[0];
+const requestHandler = (req, res) => {
+  const path = (req.url ?? '/').split('?')[0];
 
-    // Health endpoint must answer before auth or presence matters, so an
-    // operator can probe a self-signed relay with curl -k.
-    if (path === HEALTH_PATH) {
-      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
-      res.end(healthBody());
-      return;
-    }
+  // Health endpoint must answer before auth or presence matters, so an
+  // operator can probe a self-signed relay with curl -k.
+  if (path === HEALTH_PATH) {
+    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+    res.end(healthBody());
+    return;
+  }
 
-    if (req.method !== 'GET' && req.method !== 'HEAD') {
-      res.writeHead(405, { allow: 'GET, HEAD' }).end();
-      return;
-    }
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    res.writeHead(405, { allow: 'GET, HEAD' }).end();
+    return;
+  }
 
-    serveStatic(req, res);
-  },
-);
+  serveStatic(req, res);
+};
+
+const httpServer = INSECURE
+  ? createHttpServer(requestHandler)
+  : createHttpsServer(
+      { key: tls.key, cert: tls.cert, minVersion: 'TLSv1.2' },
+      requestHandler,
+    );
 
 // Bound so a slow-loris client cannot hold a socket open forever.
 httpServer.headersTimeout = 20_000;
@@ -165,12 +182,23 @@ wss.on('connection', (socket) => {
 
 httpServer.listen({ port: PORT, host: HOST }, () => {
   const shown = HOST === '0.0.0.0' ? 'localhost' : HOST;
+  const scheme = INSECURE ? 'ws' : 'wss';
   log('');
   log('  HUSH relay');
-  log(`  wss://${shown}:${PORT}/ws`);
-  log(`  https://${shown}:${PORT}${HEALTH_PATH}`);
-  log(`  fingerprint ${tls.fingerprint}${tls.selfSigned ? '  (self-signed)' : ''}`);
+  log(`  ${scheme}://${shown}:${PORT}/ws`);
+  log(`  ${INSECURE ? 'http' : 'https'}://${shown}:${PORT}${HEALTH_PATH}`);
+  if (!INSECURE) {
+    log(`  fingerprint ${tls.fingerprint}${tls.selfSigned ? '  (self-signed)' : ''}`);
+  }
   log(`  online at boot: ${hub.size}`);
+  if (INSECURE) {
+    log('');
+    log('  PLAINTEXT MODE. Routing metadata is readable by anyone on the path.');
+    log('  Fine on loopback (ws://127.0.0.1) — not fine on a shared network.');
+    if (HOST === '0.0.0.0') {
+      log(`  Bound to ALL interfaces on ${PORT}: anyone who can reach this port joins your roster.`);
+    }
+  }
   log('');
 });
 

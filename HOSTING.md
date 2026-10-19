@@ -1,7 +1,50 @@
 # Hosting the relay, free, no card
 
-Three options, cheapest-effort first. All three are verified against the real
+Four options, cheapest-effort first. All four are verified against the real
 protocol — the e2e suite in `server/tools/e2e.js` runs against each of them.
+
+```bash
+node server/tools/e2e.js ws://127.0.0.1:8787/ws
+```
+
+---
+
+## Option 0 — Plain relay on your own machine
+
+**Cost:** nothing. **Card required:** no. **Certificate required:** no.
+**Uptime:** only while the process runs.
+
+The fastest way to see HUSH working, and the only option that needs nothing at
+all — not a domain, not an account, not a certificate.
+
+```bash
+cd server
+npm install
+HUSH_INSECURE=1 HUSH_PORT=8787 node src/index.js
+```
+
+```
+  HUSH relay
+  ws://127.0.0.1:8787/ws
+  http://127.0.0.1:8787/healthz
+
+  PLAINTEXT MODE. Routing metadata is readable by anyone on the path.
+  Fine on loopback (ws://127.0.0.1) — not fine on a shared network.
+```
+
+Point the app at `ws://127.0.0.1:8787/ws`. On an emulator, where the host PC is
+`10.0.2.2`, use `ws://10.0.2.2:8787/ws` instead.
+
+**Cleartext is only accepted for loopback**, and that limit is enforced twice on
+purpose: `RelayUrls.isAcceptable` in the client, and the `domain-config` block
+in `network_security_config.xml`. Anywhere else, `wss://` is required. Loopback
+is exempt because those bytes never touch a wire — making a laptop install
+openssl purely to talk to itself is the surest way to make self-hosting feel
+impossible.
+
+On a real phone, `127.0.0.1` is the phone, not your PC. For that, see
+[Option 3](#option-3--node-relay-on-a-box-you-control), which covers reaching a
+PC over Wi-Fi with a self-signed certificate and no domain.
 
 ---
 
@@ -112,6 +155,32 @@ mints a self-signed one on first run, and the client pins it on first contact.
 
 Best when you want a relay you can inspect with `tcpdump`, or you already have
 a VPS.
+
+### Reaching a PC over Wi-Fi from a real phone
+
+No domain and no CA required. Give the relay your PC's LAN address and it puts
+an `IP:` SAN in the generated certificate:
+
+```bash
+HUSH_DOMAIN=192.168.1.50 node src/index.js
+```
+
+```
+  wss://192.168.1.50:8443/ws
+  fingerprint A1:B2:C3:...  (self-signed)
+```
+
+Enter `wss://192.168.1.50:8443/ws` in the app. The first connection shows a
+certificate prompt — accept it, and the fingerprint is pinned from then on. A
+changed certificate stops the app rather than reconnecting silently.
+
+Both devices must be on the same network, and Windows Firewall will prompt on
+first run; allow it on the private profile only.
+
+Note the asymmetry with Option 0, and it is deliberate: a LAN IP over cleartext
+is refused, because those bytes *do* cross a network that other devices can
+sniff. `127.0.0.1` and `10.0.2.2` do not have that property, which is the only
+reason they are allowed to skip TLS.
 
 ---
 

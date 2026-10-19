@@ -222,7 +222,11 @@ fun OnboardingScreen(
                         onValueChange = { relay = it.trim() },
                         modifier = Modifier.fillMaxWidth(),
                         placeholder = {
-                            Text("wss://your-relay.example/ws", color = HushTextTertiary, fontSize = 13.sp)
+                            Text(
+                                "ws://127.0.0.1:8787/ws",
+                                color = HushTextTertiary,
+                                fontSize = 13.sp,
+                            )
                         },
                         singleLine = true,
                         shape = RoundedCornerShape(14.dp),
@@ -239,6 +243,16 @@ fun OnboardingScreen(
                     Spacer(Modifier.height(8.dp))
                     Text(
                         text = "The server your messages pass through. It can read none of them. Everyone on this relay can see each other.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = HushTextTertiary,
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    // Self-hosting is the whole point of an open-source relay,
+                    // so the local case is spelled out rather than left as a
+                    // thing you have to infer from the protocol docs.
+                    Text(
+                        text = "Running your own? Use ws://127.0.0.1:8787/ws on this machine, " +
+                            "or wss:// for a server elsewhere.",
                         style = MaterialTheme.typography.bodySmall,
                         color = HushTextTertiary,
                     )

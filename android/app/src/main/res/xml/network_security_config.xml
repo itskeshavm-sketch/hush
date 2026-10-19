@@ -7,11 +7,19 @@
   The resolution here is NOT to blanket-allow cleartext or blanket-trust user
   CAs. It is:
 
-    1. Cleartext is disabled outright. HUSH is meaningless over plain HTTP, so
-       the ability to downgrade is removed rather than discouraged.
-    2. Debug builds may trust user-installed CAs, so a developer with a real
+    1. Cleartext is denied everywhere by default. HUSH is meaningless over
+       plain HTTP to a remote host, so the ability to downgrade is removed
+       rather than discouraged.
+    2. Cleartext is permitted ONLY to loopback (and 10.0.2.2, the emulator's
+       alias for the host machine). Those bytes never touch a wire, so there
+       is nothing to eavesdrop — and without this, "run the relay on my own PC
+       and point the app at it" cannot work at all without installing a
+       certificate first. Enumerated per-domain because the platform config
+       cannot express "any private range" without also opening the app to
+       every cleartext host on the internet.
+    3. Debug builds may trust user-installed CAs, so a developer with a real
        Let's Encrypt cert can test with the full system trust store.
-    3. Release builds trust only the system store. Self-signed relay certs are
+    4. Release builds trust only the system store. Self-signed relay certs are
        handled in code by TlsPinner, which pins a fingerprint on first connect
        and fails closed on mismatch. A pinned, deliberately-accepted self-signed
        cert is a different guarantee from "trust everything", and it is the only
@@ -24,6 +32,13 @@
             <certificates src="user" />
         </trust-anchors>
     </base-config>
+
+    <!-- Loopback only. Mirrors RelayUrls.LOOPBACK_HOSTS; keep the two in step. -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">localhost</domain>
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">10.0.2.2</domain>
+    </domain-config>
 
     <debug-overrides>
         <trust-anchors>

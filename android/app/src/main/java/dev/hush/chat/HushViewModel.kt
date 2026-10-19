@@ -382,8 +382,8 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
         val url = relay.trim()
-        if (!url.startsWith("wss://")) {
-            emitToast("Relay must be a wss:// address")
+        if (!dev.hush.chat.net.RelayUrls.isAcceptable(url)) {
+            emitToast(dev.hush.chat.net.RelayUrls.rejectionReason(url))
             return
         }
 
@@ -405,8 +405,8 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
 
     fun setRelayUrl(url: String) {
         val trimmed = url.trim()
-        if (trimmed.isEmpty() || !trimmed.startsWith("wss://")) {
-            emitToast("Relay must be a wss:// URL")
+        if (!dev.hush.chat.net.RelayUrls.isAcceptable(trimmed)) {
+            emitToast(dev.hush.chat.net.RelayUrls.rejectionReason(trimmed))
             return
         }
         prefs.edit().putString(KEY_RELAY_URL, trimmed).apply()

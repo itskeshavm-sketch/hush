@@ -409,6 +409,25 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
             emitToast(dev.hush.chat.net.RelayUrls.rejectionReason(trimmed))
             return
         }
+
+        // A pin belongs to one relay, not to the app. Pointing at a different
+        // host means a different certificate, and keeping the old pin would
+        // make the new relay look like a man-in-the-middle — the user would be
+        // stuck staring at a trust error for a relay they just chose on
+        // purpose. Clearing it hands the new host its own first-use trust,
+        // which is exactly what TOFU is supposed to do. Changing only the port
+        // or path on the same host keeps the pin, since that is the same relay.
+        val pinHost = prefs.getString(KEY_RELAY_PIN_HOST, null)
+        val newHost = dev.hush.chat.net.RelayUrls.hostOf(trimmed)
+        if (pinHost != null && pinHost != newHost) {
+            prefs.edit()
+                .remove(KEY_RELAY_PIN)
+                .putString(KEY_RELAY_PIN_HOST, newHost)
+                .apply()
+        } else if (pinHost == null && newHost != null) {
+            prefs.edit().putString(KEY_RELAY_PIN_HOST, newHost).apply()
+        }
+
         prefs.edit().putString(KEY_RELAY_URL, trimmed).apply()
         startRelay()
     }
@@ -425,7 +444,10 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
         // re-runs first-use trust and a pinned relay is really just a trusted
         // one — which is the exact failure pinning exists to prevent.
         relay.onPinObserved = { fp ->
-            prefs.edit().putString(KEY_RELAY_PIN, fp).apply()
+            prefs.edit()
+                .putString(KEY_RELAY_PIN, fp)
+                .putString(KEY_RELAY_PIN_HOST, dev.hush.chat.net.RelayUrls.hostOf(relayUrl))
+                .apply()
         }
 
         relay.connect(relayUrl, pin, hello)
@@ -2048,6 +2070,9 @@ class HushViewModel(app: Application) : AndroidViewModel(app) {
         private const val KEY_DISPLAY_NAME = "display_name"
         private const val KEY_RELAY_URL = "relay_url"
         private const val KEY_RELAY_PIN = "relay_pin"
+
+        /** Host the pinned certificate belongs to, so a relay switch clears the pin. */
+        private const val KEY_RELAY_PIN_HOST = "relay_pin_host"
         private const val KEY_JOINED_AT = "joined_at"
         private const val KEY_APP_THEME = "app_theme"
         private const val KEY_PIN_HASH = "pin_hash"

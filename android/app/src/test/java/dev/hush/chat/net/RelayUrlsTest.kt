@@ -2,6 +2,7 @@ package dev.hush.chat.net
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -66,6 +67,32 @@ class RelayUrlsTest {
         assertTrue("cleartext rejection should mention localhost", cleartext.contains("localhost"))
         val garbage = RelayUrls.rejectionReason("not a url")
         assertTrue("generic rejection should name the expected form", garbage.contains("wss://"))
+    }
+
+    @Test
+    fun `hostOf identifies which relay a pin belongs to`() {
+        // The pinned certificate is scoped by host: changing it clears the pin,
+        // changing only the port must not. That distinction lives entirely in
+        // this parse, so it gets its own tests.
+        assertEquals("relay.example.com", RelayUrls.hostOf("wss://relay.example.com/ws"))
+        assertEquals("relay.example.com", RelayUrls.hostOf("wss://relay.example.com:8443/ws"))
+        assertEquals("relay.example.com", RelayUrls.hostOf("wss://RELAY.EXAMPLE.COM:8443/ws"))
+
+        // Same host, different port or path — same relay, pin must survive.
+        assertEquals(
+            RelayUrls.hostOf("wss://relay.example.com:8443/ws"),
+            RelayUrls.hostOf("wss://relay.example.com:9443/ws"),
+        )
+
+        // Different host — pin must be dropped, or the new relay looks like a
+        // man-in-the-middle and the user is stuck on a trust error.
+        assertFalse(
+            RelayUrls.hostOf("wss://relay.example.com/ws") == RelayUrls.hostOf("wss://other.example.com/ws")
+        )
+
+        assertEquals("127.0.0.1", RelayUrls.hostOf("ws://127.0.0.1:8787/ws"))
+        assertNull(RelayUrls.hostOf("not a url"))
+        assertNull(RelayUrls.hostOf("wss://"))
     }
 
     @Test

@@ -23,6 +23,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Dns
 import androidx.compose.material.icons.filled.Fingerprint
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -78,8 +79,10 @@ fun SettingsScreen(
     pinSet: Boolean,
     duressSet: Boolean,
     relayFingerprint: String?,
+    relayUrl: String,
     onDisplayNameChange: (String) -> Unit,
     onThemeChange: (String) -> Unit,
+    onSetRelayUrl: (String) -> Unit,
     onSetAppPin: (String) -> Boolean,
     onSetDuressPin: (String) -> Boolean,
     onVerifyPin: (String) -> Boolean,
@@ -90,6 +93,7 @@ fun SettingsScreen(
     modifier: Modifier = Modifier,
 ) {
     var name by remember(displayName) { mutableStateOf(displayName) }
+    var relayField by remember(relayUrl) { mutableStateOf(relayUrl) }
     var pinStep by remember(pinSet) { mutableStateOf(PinStep.NONE) }
     var pinFirst by remember { mutableStateOf("") }
     var pinError by remember { mutableStateOf<String?>(null) }
@@ -156,6 +160,26 @@ fun SettingsScreen(
             Spacer(Modifier.height(14.dp))
 
             SectionHeader("Connection")
+
+            // Self-hosting has to be reachable after onboarding, not only during
+            // it. Without this the relay address is fixed at the moment the
+            // display name is chosen, and someone who installed from a public
+            // relay has no way to move to their own short of wiping the app.
+            SettingsField(
+                value = relayField,
+                onValueChange = { relayField = it },
+                label = "Relay server",
+                icon = { Icon(Icons.Filled.Dns, contentDescription = null, tint = HushTextTertiary) },
+                onCommit = { it.trim().takeIf { v -> v != relayUrl }?.let(onSetRelayUrl) },
+            )
+            FactRow2(
+                "Run your own? Use ws://127.0.0.1:8787/ws for a relay on this machine " +
+                    "(or 10.0.2.2 from the emulator), and wss:// for one anywhere else. " +
+                    "Switching relays clears the pinned certificate, because a pin belongs " +
+                    "to one server, not to this app.",
+            )
+
+            Spacer(Modifier.height(12.dp))
 
             Column(
                 modifier = Modifier

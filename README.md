@@ -314,8 +314,15 @@ presentation files.
 Three ways, in order of how permanent they are:
 
 1. **At runtime.** Onboarding → *Advanced → Use your own server*, or *Settings →
-   Relay* later. Nothing needs rebuilding. This is the recommended path for
-   self-hosting.
+   Connection → Relay server* at any time afterwards. Nothing needs
+   rebuilding, and you are not locked into whatever relay you happened to
+   install with. This is the recommended path for self-hosting.
+
+   Switching to a different host clears the pinned certificate, because a pin
+   belongs to one relay rather than to the app — otherwise every new server
+   would look like a man-in-the-middle and you would be stuck on a trust error
+   for a relay you chose on purpose. Changing only the port or path keeps the
+   pin, since that is the same server.
 2. **At build time.** Edit `DEFAULT_RELAY` in `android/app/build.gradle.kts`:
 
    ```kotlin
@@ -405,11 +412,11 @@ cd server && npm test                # 21 tests
 HUSH_INSECURE=1 node tools/e2e.js ws://127.0.0.1:8787/ws   # 13 checks
 
 # client crypto and state
-.\scripts\build-apk.ps1 -Task testDebugUnitTest             # 43 tests
+.\scripts\build-apk.ps1 -Task testDebugUnitTest             # 44 tests
 ```
 
 The client suite is `DoubleRatchetTest` (18), `FirstContactTest` (9),
-`StateEqualityTest` (7) and `RelayUrlsTest` (9), covering key uniqueness,
+`StateEqualityTest` (7) and `RelayUrlsTest` (10), covering key uniqueness,
 replay, reordering, tampering, prekey substitution, unbounded-work attacks, and
 the relay-URL security boundary.
 
@@ -417,7 +424,8 @@ the relay-URL security boundary.
 loopback is a security decision, and the natural "fix" for a self-hoster who
 cannot connect is to widen that check. The test pins the boundary — including
 hosts that merely *start* with `127.0.0.1`, and userinfo such as
-`ws://127.0.0.1@evil.example` — so widening it has to be a deliberate act.
+`ws://127.0.0.1@evil.example` — so widening it has to be a deliberate act. It
+also covers the host parse that decides when a pinned certificate is dropped.
 
 ---
 

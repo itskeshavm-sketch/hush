@@ -41,7 +41,7 @@ object RelayUrls {
     )
 
     /** Host portion of a `ws://` / `wss://` URL, lowercased, or null if unparseable. */
-    private fun hostOf(url: String): String? {
+    fun hostOf(url: String): String? {
         val afterScheme = when {
             url.startsWith("wss://", ignoreCase = true) -> url.substring(6)
             url.startsWith("ws://", ignoreCase = true) -> url.substring(5)
